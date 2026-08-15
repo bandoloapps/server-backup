@@ -36,6 +36,8 @@ export const get_pass_from_user = async () => {
 
 export const initial_backup = process.env.INITIAL_BACKUP?.trim().toLocaleLowerCase() === 'true';
 
+export const initial_backup_force_fresh = process.env.INITIAL_BACKUP_FORCE_FRESH?.trim().toLowerCase() === 'true';
+
 export const initial_backup_worker_count = Number(process.env.INITIAL_BACKUP_WORKER_COUNT || "4");
 export const live_backup = process.env.LIVE_BACKUP?.trim().toLowerCase() === 'true'
 
