@@ -51,7 +51,7 @@ const safe_question = async (query: string): Promise<string> => {
     });
 
     return new Promise((resolve) => {
-        const stdin = process.openStdin();
+        const stdin = process.stdin;
         process.stdin.on("data", (char: string) => {
             char = char + "";
             switch (char) {
