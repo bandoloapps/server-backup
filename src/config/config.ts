@@ -12,6 +12,12 @@ export let key: Buffer | undefined = undefined;
 export const guild_id = process.env.GUILD_ID?.trim();
 
 export const get_pass_from_user = async () => {
+    if (!process.stdin.isTTY) {
+        key = undefined; // empty key → no encryption
+        consola.info('Non-interactive start (no TTY): skipping password prompt — encryption disabled (empty key).');
+        return;
+    }
+
     consola.warn('Keep the password ALWAYS the same. Or else the data may corrupt. You cannot change the password since everything in the DB is being encrypted with 1 password only.')
     consola.warn('You can enter an empty password to disable encryption.')
     let given_pass;
