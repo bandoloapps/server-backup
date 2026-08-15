@@ -20,7 +20,7 @@ export const define_messages = (sequelize: Sequelize) => {
             attachments: {
                 type: STRING
             }    
-        }, {timestamps: false})
+        }, {timestamps: false, indexes: [{fields: ['messageId']}]})
 
     return model;
 }

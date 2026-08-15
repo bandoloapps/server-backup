@@ -3,6 +3,8 @@ import { Sequelize } from "sequelize";
 import { get_pass_from_user, token } from "./config/config";
 import { define_messages } from "./database/models/messages";
 import { define_attachments } from "./database/models/attachments";
+import { define_initial_backup_checkpoints } from "./database/models/initial_backup_checkpoints";
+import { define_initial_backup_progress } from "./database/models/initial_backup_progress";
 import { message_create_listener } from "./events/messageCreate";
 import { initial_backup_scraper } from "./services/initialBackupServices";
 import consola from "consola";
@@ -33,6 +35,8 @@ export const sequelize = new Sequelize({
 
 export const messages_model = define_messages(sequelize);
 export const attachments_model = define_attachments(sequelize);
+export const initial_backup_checkpoints_model = define_initial_backup_checkpoints(sequelize);
+export const initial_backup_progress_model = define_initial_backup_progress(sequelize);
 
 consola.warn('Syncing DB may take a while... please be patient.')
 sequelize.sync({alter: true}).then(async () => {
