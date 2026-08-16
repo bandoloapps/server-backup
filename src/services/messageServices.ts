@@ -2,7 +2,8 @@ import { Message, blockQuote } from "discord.js";
 import { AttachmentData, ExtractedContent, MessageData } from "../..";
 import { encrypt } from "./encryptionServices";
 import { ignore_channels, ignore_users } from "../config/config";
-import { attachments_model, messages_model } from "..";
+import { attachments_model, messages_model, users_model, channels_model } from "..";
+import { upsert_cache_for_message } from "./cacheServices";
 import consola from "consola";
 
 export const fetch_and_save_msgs = async (channelId: string) => {
@@ -82,6 +83,9 @@ export const save_msg_to_db = async (raw_data: ExtractedContent) => {
         //ignoring from configs
         if(ignore_channels.includes(channelId)) return;
         if(ignore_users.includes(userId)) return;
+
+        //cache user/channel/thread names — a cache failure never blocks the message save (D4)
+        await upsert_cache_for_message(raw_data, users_model, channels_model);
 
         const attachments = Array.from(attachments_raw);
 
