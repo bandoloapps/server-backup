@@ -7,7 +7,8 @@
     "build": "npx tsc",
     "dev": "nodemon .",
     "start": "node .",
-    "decrypt": "node decryptDb.js"
+    "decrypt": "node decryptDb.js",
+    "export": "node dist/export/exportMessages.js"
   },
   "keywords": [
     "Discord Server Backup",
