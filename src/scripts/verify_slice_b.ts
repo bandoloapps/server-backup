@@ -503,6 +503,83 @@ const test_read_watermark = () => {
     }
 };
 
+const test_incremental_filter_rejected = async () => {
+    console.log("\n== runExport: incremental + filter rejected ==");
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "slice-b-inc-filter-"));
+    const dbPath = path.join(tempDir, "server.db");
+    let sequelize: Sequelize | null = null;
+    try {
+        sequelize = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
+        const messages = sequelize.define("messages", {
+            channelId: { type: STRING }, userId: { type: STRING },
+            messageId: { type: STRING }, time: { type: INTEGER },
+            text: { type: BLOB },
+        }, { timestamps: false, freezeTableName: true });
+        await sequelize.sync();
+        await messages.bulkCreate([{ channelId: "c1", userId: "u1", messageId: "m1", time: 1000, text: Buffer.from("hi") }]);
+        await sequelize.close();
+        sequelize = null;
+
+        const reader = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
+        const outDir = path.join(tempDir, "export");
+        let threw = false;
+        try {
+            await runExport(reader, baseOptions({ incremental: true, channelIds: ["c1"], watermark: 0 }), outDir);
+        } catch (e: any) {
+            threw = /incremental cannot be combined/i.test(e.message);
+        }
+        await reader.close();
+
+        check("incremental + --channels throws before any write", threw);
+        check("messages.json not written on incremental+filter rejection", !fs.existsSync(path.join(outDir, "messages.json")));
+        check("watermark.json not written on incremental+filter rejection", !fs.existsSync(path.join(outDir, "watermark.json")));
+    } finally {
+        if (sequelize) { try { await sequelize.close(); } catch {} }
+        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    }
+};
+
+const test_watermark_never_lowered = async () => {
+    console.log("\n== runExport: watermark never lowered ==");
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "slice-b-wm-lower-"));
+    const dbPath = path.join(tempDir, "server.db");
+    let sequelize: Sequelize | null = null;
+    try {
+        sequelize = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
+        const messages = sequelize.define("messages", {
+            channelId: { type: STRING }, userId: { type: STRING },
+            messageId: { type: STRING }, time: { type: INTEGER },
+            text: { type: BLOB },
+        }, { timestamps: false, freezeTableName: true });
+        await sequelize.sync();
+        await messages.bulkCreate([
+            { channelId: "c1", userId: "u1", messageId: "m1", time: 1000, text: Buffer.from("older") },
+        ]);
+        await sequelize.close();
+        sequelize = null;
+
+        const reader = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
+        const outDir = path.join(tempDir, "export");
+        fs.mkdirSync(outDir, { recursive: true });
+        fs.writeFileSync(path.join(outDir, "watermark.json"), JSON.stringify({ maxTime: 9999 }));
+        let threw = false;
+        try {
+            await runExport(reader, baseOptions(), outDir);
+        } catch (e: any) {
+            threw = /watermark regression rejected/i.test(e.message);
+        }
+        await reader.close();
+
+        const wm = JSON.parse(fs.readFileSync(path.join(outDir, "watermark.json"), "utf-8"));
+        check("full export with lower maxTime throws watermark regression error", threw);
+        check("existing watermark is preserved", wm.maxTime === 9999);
+        check("messages.json not written when watermark regressed", !fs.existsSync(path.join(outDir, "messages.json")));
+    } finally {
+        if (sequelize) { try { await sequelize.close(); } catch {} }
+        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    }
+};
+
 // ---------- run ----------
 
 const main = async () => {
@@ -524,6 +601,8 @@ const main = async () => {
     await test_no_cache_tables();
     await test_wrong_password_writes_nothing();
     test_read_watermark();
+    await test_incremental_filter_rejected();
+    await test_watermark_never_lowered();
 
     console.log(failed === 0 ? "\nVERIFY SLICE B: ALL PASS" : `\nVERIFY SLICE B: ${failed} CHECKS FAILED`);
     process.exit(failed === 0 ? 0 : 1);

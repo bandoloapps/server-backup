@@ -484,6 +484,14 @@ export const runExport = async (
     options: ExportOptions,
     outDir: string
 ): Promise<ExportResult> => {
+    if (options.incremental && (options.channelIds.length > 0 || options.from != null || options.to != null)) {
+        throw new Error(
+            "--incremental cannot be combined with --channels, --from, or --to. " +
+            "A filtered export would write a watermark based on a subset of messages, " +
+            "causing a later unfiltered --incremental to skip never-exported messages."
+        );
+    }
+
     const { messages, users, channels } = await loadRecords(sequelize);
 
     // decrypt first — a single wrong/missing key aborts the whole export and
@@ -504,6 +512,17 @@ export const runExport = async (
     }
 
     const result = buildExport({ messages: decrypted, users, channels }, options);
+
+    // defensive guard: a filtered or otherwise regressed export must never
+    // lower the watermark and silently hide messages from future runs.
+    // Check before writing any output so a regression leaves files untouched.
+    const existingWatermark = readWatermark(outDir);
+    if (result.maxTime != null && existingWatermark != null && result.maxTime < existingWatermark) {
+        throw new Error(
+            `watermark regression rejected: new maxTime (${result.maxTime}) is lower ` +
+            `than the existing watermark (${existingWatermark})`
+        );
+    }
 
     fs.mkdirSync(outDir, { recursive: true });
     fs.writeFileSync(path.join(outDir, "messages.json"), JSON.stringify(result.output, null, 2) + "\n");
