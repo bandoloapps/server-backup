@@ -10,6 +10,7 @@
  * verification per the design.
  */
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { Sequelize } from "sequelize";
 import { define_messages } from "../database/models/messages";
@@ -20,7 +21,6 @@ import { define_initial_backup_checkpoints } from "../database/models/initial_ba
 import { define_initial_backup_progress } from "../database/models/initial_backup_progress";
 
 const SRC_DB = path.join(__dirname, "..", "..", "server.db");
-const COPY_DB = "/tmp/real_copy.db";
 
 let failed = 0;
 const check = (name: string, cond: boolean) => {
@@ -30,39 +30,53 @@ const check = (name: string, cond: boolean) => {
 
 const main = async () => {
     if(!fs.existsSync(SRC_DB)) { console.error("no server.db found"); process.exit(2); }
-    fs.copyFileSync(SRC_DB, COPY_DB);
 
-    const sequelize = new Sequelize({ dialect: "sqlite", storage: COPY_DB, logging: false });
+    //Copy into a private temp dir (mkdtempSync creates with 0700); chmod the copy 0600;
+    //clean up in finally so the plaintext DB snapshot is never left behind.
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "slice-a-"));
+    const COPY_DB = path.join(tempDir, "real_copy.db");
+    let sequelize: Sequelize | null = null;
+    try {
+        fs.copyFileSync(SRC_DB, COPY_DB);
+        fs.chmodSync(COPY_DB, 0o600);
 
-    //real production model set — same registrations as src/index.ts
-    const messages_model = define_messages(sequelize);
-    const attachments_model = define_attachments(sequelize);
-    const users_model = define_users(sequelize);
-    const channels_model = define_channels(sequelize);
-    const checkpoints_model = define_initial_backup_checkpoints(sequelize);
-    const progress_model = define_initial_backup_progress(sequelize);
+        sequelize = new Sequelize({ dialect: "sqlite", storage: COPY_DB, logging: false });
 
-    const count_before = await messages_model.count();
-    console.log(`messages before sync: ${count_before}`);
+        //real production model set — same registrations as src/index.ts
+        const messages_model = define_messages(sequelize);
+        const attachments_model = define_attachments(sequelize);
+        const users_model = define_users(sequelize);
+        const channels_model = define_channels(sequelize);
+        const checkpoints_model = define_initial_backup_checkpoints(sequelize);
+        const progress_model = define_initial_backup_progress(sequelize);
 
-    //the exact additive sync the bot runs at startup
-    await sequelize.sync({ alter: true });
+        const count_before = await messages_model.count();
+        console.log(`messages before sync: ${count_before}`);
 
-    const count_after = await messages_model.count();
-    check("messages COUNT unchanged after additive sync", count_after === count_before && count_before > 0);
+        //the exact additive sync the bot runs at startup
+        await sequelize.sync({ alter: true });
 
-    const tables = (await sequelize.query(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", { type: "SELECT" }
-    )).map((r: any) => r.name);
-    check("users table exists", tables.includes("users"));
-    check("channels table exists", tables.includes("channels"));
-    check("messages table preserved", tables.includes("messages"));
-    check("attachments table preserved", tables.includes("attachments"));
-    check("initial_backup_checkpoints table preserved", tables.includes("initial_backup_checkpoints"));
-    check("initial_backup_progress table preserved", tables.includes("initial_backup_progress"));
+        const count_after = await messages_model.count();
+        check("messages COUNT unchanged after additive sync", count_after === count_before && count_before > 0);
 
-    await sequelize.close();
-    console.log(failed === 0 ? "\nLIVE-DB CHECK PASSED" : `\n${failed} CHECKS FAILED`);
+        const tables = (await sequelize.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", { type: "SELECT" }
+        )).map((r: any) => r.name);
+        check("users table exists", tables.includes("users"));
+        check("channels table exists", tables.includes("channels"));
+        check("messages table preserved", tables.includes("messages"));
+        check("attachments table preserved", tables.includes("attachments"));
+        check("initial_backup_checkpoints table preserved", tables.includes("initial_backup_checkpoints"));
+        check("initial_backup_progress table preserved", tables.includes("initial_backup_progress"));
+
+        await sequelize.close();
+        sequelize = null;
+        console.log(failed === 0 ? "\nLIVE-DB CHECK PASSED" : `\n${failed} CHECKS FAILED`);
+    } finally {
+        if (sequelize) { try { await sequelize.close(); } catch {} }
+        try { fs.unlinkSync(COPY_DB); } catch {}
+        try { fs.rmdirSync(tempDir); } catch {}
+    }
     process.exit(failed === 0 ? 0 : 1);
 };
 

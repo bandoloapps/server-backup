@@ -11,7 +11,7 @@ import { Collection, GuildTextBasedChannel, Message } from "discord.js";
 import { get_msg_content, save_msg_to_db } from "./messageServices";
 import { fetch_channels } from "./channelServices";
 import { guild_id, initial_backup, initial_backup_force_fresh, initial_backup_worker_count } from "../config/config";
-import { client, initial_backup_checkpoints_model, initial_backup_progress_model, sequelize } from "..";
+import { attachments_model, channels_model, client, initial_backup_checkpoints_model, initial_backup_progress_model, messages_model, sequelize, users_model } from "..";
 
 type ChannelUnit = {
     channel: GuildTextBasedChannel;
@@ -219,7 +219,7 @@ const crawl_channel = async (channel: GuildTextBasedChannel, start_cursor: Messa
             const msg = raw_msg[1];
             
             const raw_data = await get_msg_content(msg);
-            await save_msg_to_db(raw_data)
+            await save_msg_to_db(raw_data, messages_model, attachments_model, users_model, channels_model)
 
             if(raw_data.thread){
                 //thread rows are written at enqueue so a crash never loses them (Decision 4)

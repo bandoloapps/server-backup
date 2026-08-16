@@ -2,7 +2,6 @@ import { Message, blockQuote } from "discord.js";
 import { AttachmentData, ExtractedContent, MessageData } from "../..";
 import { encrypt } from "./encryptionServices";
 import { ignore_channels, ignore_users } from "../config/config";
-import { attachments_model, messages_model, users_model, channels_model } from "..";
 import { upsert_cache_for_message } from "./cacheServices";
 import consola from "consola";
 
@@ -72,7 +71,7 @@ export const get_msg_content = async (msg: Message) => {
     }
 }
 
-export const save_msg_to_db = async (raw_data: ExtractedContent) => {
+export const save_msg_to_db = async (raw_data: ExtractedContent, messages_model: any, attachments_model: any, users_model: any, channels_model: any) => {
     try{
         const {channelId, messageId, userId, time, text, attachments: attachments_raw, thread} = raw_data;
         
@@ -120,13 +119,21 @@ export const save_msg_to_db = async (raw_data: ExtractedContent) => {
     }
 }
 
-export const update_msg_to_db = async (raw_data: ExtractedContent) => {
+export const update_msg_to_db = async (raw_data: ExtractedContent, messages_model: any, attachments_model: any, users_model: any, channels_model: any) => {
     try{
         const {channelId, messageId, userId, time, text, attachments: attachments_raw, thread} = raw_data;
         
         //ignoring from configs
         if(ignore_channels.includes(channelId)) return;
         if(ignore_users.includes(userId)) return;
+
+        //cache user/channel/thread names on edit path too — edits are the dominant live path,
+        //so without this cache rows go stale (review fix). Failure never blocks the message update (D4).
+        try {
+            await upsert_cache_for_message(raw_data, users_model, channels_model);
+        } catch(err: any) {
+            consola.error(`Failed to upsert cache on edit path for ${messageId}: ${err.message}`);
+        }
 
         //making sure we have smth to update
         const previous_message = await messages_model.findOne({where: {messageId}});

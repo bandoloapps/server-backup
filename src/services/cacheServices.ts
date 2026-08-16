@@ -44,16 +44,16 @@ export const upsert_cache_for_message = async (
     }
 
     //thread channel row from raw_data.thread (D2) — failure is logged, never thrown (D4)
-    if(raw_data.thread){
-        try{
+    try{
+        if(raw_data.thread){
             await channels_model.upsert({
                 channelId: raw_data.thread.id,
                 name: raw_data.thread.name,
                 type: 'thread',
                 parentId: raw_data.thread.parentId ?? null
             });
-        }catch(err: any){
-            consola.error(`Failed to upsert thread cache for ${raw_data.thread.id}: ${err.message}`);
         }
+    }catch(err: any){
+        consola.error(`Failed to upsert thread cache for ${raw_data.thread?.id}: ${err.message}`);
     }
 }
