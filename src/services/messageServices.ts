@@ -25,7 +25,17 @@ export const get_msg_content = async (msg: Message) => {
             time: new Date(msg.createdTimestamp).getTime(),
             text: msg.content,
             attachments: new Map<string, Buffer>(),
-            thread: null
+            thread: null,
+            author: {
+                username: msg.author.username,
+                displayName: msg.author.displayName,
+                globalName: msg.author.globalName
+            },
+            channel: {
+                name: 'name' in msg.channel ? msg.channel.name : null,
+                type: msg.channel.isThread() ? 'thread' : 'text',
+                parentId: msg.channel.isThread() ? (msg.channel.parentId ?? null) : null
+            }
         }
 
         //fetching attachments
