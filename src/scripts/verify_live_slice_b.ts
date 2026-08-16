@@ -21,12 +21,11 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { execFileSync } from "child_process";
+import { QueryTypes, Sequelize } from "sequelize";
 
 const SRC_DB = path.join(__dirname, "..", "..", "server.db");
 const EXPORTER_JS = path.join(__dirname, "..", "export", "exportMessages.js");
 const GUILD_ID = "771474521026330654";
-const EXPECTED_TOTAL = 313;
-const EXPECTED_EMITTED = 263; // 313 rows - 50 empty/whitespace texts
 
 let failed = 0;
 const check = (name: string, cond: boolean) => {
@@ -50,11 +49,25 @@ const main = async () => {
     if (!fs.existsSync(EXPORTER_JS)) { console.error("dist/export/exportMessages.js missing — run npm run build first"); process.exit(2); }
 
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "slice-b-live-"));
+    const copiedDb = path.join(tempDir, "server.db");
+    let counter: Sequelize | null = null;
     try {
         // minimal .env: only GUILD_ID — tests the .env path without copying secrets
         fs.writeFileSync(path.join(tempDir, ".env"), `GUILD_ID = "${GUILD_ID}"\n`);
-        fs.copyFileSync(SRC_DB, path.join(tempDir, "server.db"));
-        fs.chmodSync(path.join(tempDir, "server.db"), 0o600);
+        fs.copyFileSync(SRC_DB, copiedDb);
+        fs.chmodSync(copiedDb, 0o600);
+
+        // derive expectations from the DB itself, not a hardcoded snapshot
+        counter = new Sequelize({ dialect: "sqlite", storage: copiedDb, logging: false });
+        const totalRow = await counter.query<{ total: number }>("SELECT COUNT(*) AS total FROM messages", { type: QueryTypes.SELECT });
+        const emptyRow = await counter.query<{ empty: number }>(
+            "SELECT COUNT(*) AS empty FROM messages WHERE text IS NULL OR TRIM(CAST(text AS TEXT)) = ''",
+            { type: QueryTypes.SELECT }
+        );
+        await counter.close();
+        counter = null;
+        const expectedTotal = Number(totalRow[0].total);
+        const expectedEmitted = expectedTotal - Number(emptyRow[0].empty);
 
         // ---- run 1: full export ----
         const r1 = runExporter(tempDir, ["--out", "export"]);
@@ -87,8 +100,8 @@ const main = async () => {
         }
         check("all sessions well-formed with ISO start/end", sessionsOk);
 
-        // total emitted = 313 - 50 empty texts (real DB has no cache tables)
-        check(`emitted count ${allEntries.length} == ${EXPECTED_EMITTED}`, allEntries.length === EXPECTED_EMITTED);
+        // total emitted = DB rows - empty/whitespace texts (real DB has no cache tables)
+        check(`emitted count ${allEntries.length} == ${expectedEmitted}`, allEntries.length === expectedEmitted);
 
         // no cache tables -> unknown (<id>) fallback everywhere, no crash/skip
         const fallbackOk = allEntries.every((e: any) =>
@@ -116,7 +129,7 @@ const main = async () => {
         // dedupe
         const ids = allEntries.map((e: any) => e.id);
         check("no duplicate messageId", new Set(ids).size === ids.length);
-        check(`no messageId exceeds total rows (${EXPECTED_TOTAL})`, ids.length <= EXPECTED_TOTAL);
+        check(`no messageId exceeds total rows (${expectedTotal})`, ids.length <= expectedTotal);
 
         // watermark sidecar
         const wmFile = path.join(tempDir, "export", "watermark.json");
@@ -135,11 +148,16 @@ const main = async () => {
         check("watermark unchanged when no new messages", JSON.stringify(wm2) === JSON.stringify(wm1));
 
         // ---- run 3: bounded --from/--to -> single session ----
+        // Use a separate output directory so the bounded watermark cannot
+        // regress the main export's watermark (the exporter rejects lowering
+        // an existing watermark to prevent incremental poisoning).
         const dayStart = new Date(1604163600000).toISOString(); // 2020-10-31 13:00:00Z
         const dayEnd = new Date(1604167200000).toISOString();
-        const r3 = runExporter(tempDir, ["--out", "export", "--from", dayStart, "--to", dayEnd]);
+        const boundedOutDir = "export-bounded";
+        const boundedOutFile = path.join(tempDir, boundedOutDir, "messages.json");
+        const r3 = runExporter(tempDir, ["--out", boundedOutDir, "--from", dayStart, "--to", dayEnd]);
         check("bounded run exits 0", r3.status === 0);
-        const data3 = JSON.parse(fs.readFileSync(outFile, "utf-8"));
+        const data3 = JSON.parse(fs.readFileSync(boundedOutFile, "utf-8"));
         check("--from/--to forces a single session", Array.isArray(data3.sessions) && data3.sessions.length === 1);
         check("filter.from/to reflected", data3.filter.from === dayStart && data3.filter.to === dayEnd);
         const inRange = data3.sessions[0].timeline.every((e: any) =>
@@ -156,6 +174,7 @@ const main = async () => {
 
         console.log(failed === 0 ? "\nLIVE EXPORT CHECK PASSED" : `\n${failed} CHECKS FAILED`);
     } finally {
+        if (counter) { try { await counter.close(); } catch {} }
         try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
     }
     process.exit(failed === 0 ? 0 : 1);
