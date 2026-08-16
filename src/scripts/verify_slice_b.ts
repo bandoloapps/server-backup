@@ -511,6 +511,38 @@ const test_wrong_password_writes_nothing = async () => {
     }
 };
 
+const test_atomic_writes = async () => {
+    console.log("\n== runExport: atomic writes leave no temp files ==");
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "slice-b-atomic-"));
+    const dbPath = path.join(tempDir, "server.db");
+    let sequelize: Sequelize | null = null;
+    try {
+        sequelize = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
+        const messages = sequelize.define("messages", {
+            channelId: { type: STRING }, userId: { type: STRING },
+            messageId: { type: STRING }, time: { type: INTEGER },
+            text: { type: BLOB },
+        }, { timestamps: false, freezeTableName: true });
+        await sequelize.sync();
+        await messages.bulkCreate([{ channelId: "c1", userId: "u1", messageId: "m1", time: 1000, text: Buffer.from("hi") }]);
+        await sequelize.close();
+        sequelize = null;
+
+        const reader = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
+        const outDir = path.join(tempDir, "export");
+        await runExport(reader, baseOptions(), outDir);
+        await reader.close();
+
+        check("messages.json committed", fs.existsSync(path.join(outDir, "messages.json")));
+        check("watermark.json committed", fs.existsSync(path.join(outDir, "watermark.json")));
+        const leftovers = fs.readdirSync(outDir).filter((f) => f.startsWith(".tmp-"));
+        check("no .tmp-* files left in output directory", leftovers.length === 0);
+    } finally {
+        if (sequelize) { try { await sequelize.close(); } catch {} }
+        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    }
+};
+
 const test_read_watermark = () => {
     console.log("\n== readWatermark ==");
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "slice-b-wm-"));
@@ -646,6 +678,7 @@ const main = async () => {
     await test_run_export_scratch_db();
     await test_no_cache_tables();
     await test_wrong_password_writes_nothing();
+    await test_atomic_writes();
     test_read_watermark();
     await test_incremental_filter_rejected();
     await test_watermark_never_lowered();

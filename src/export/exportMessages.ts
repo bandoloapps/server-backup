@@ -419,6 +419,21 @@ export const buildExport = (input: ExportInput, options: ExportOptions): ExportR
     return { output, maxTime, emittedCount: unique.length };
 };
 
+// ---------- atomic file writes (R4-2) ----------
+
+const writeFileAtomic = (targetPath: string, data: string): void => {
+    const dir = path.dirname(targetPath);
+    const tmp = path.join(dir, `.tmp-${path.basename(targetPath)}-${process.pid}-${Date.now()}`);
+    const fd = fs.openSync(tmp, "w");
+    try {
+        fs.writeSync(fd, data);
+        fs.fsyncSync(fd);
+    } finally {
+        fs.closeSync(fd);
+    }
+    fs.renameSync(tmp, targetPath);
+};
+
 // ---------- watermark sidecar (B1.6, D7) ----------
 
 export const readWatermark = (outDir: string): number | null => {
@@ -547,9 +562,11 @@ export const runExport = async (
     }
 
     fs.mkdirSync(outDir, { recursive: true });
-    fs.writeFileSync(path.join(outDir, "messages.json"), JSON.stringify(result.output, null, 2) + "\n");
+    const messagesPath = path.join(outDir, "messages.json");
+    const watermarkPath = path.join(outDir, "watermark.json");
+    writeFileAtomic(messagesPath, JSON.stringify(result.output, null, 2) + "\n");
     if (result.maxTime != null) {
-        fs.writeFileSync(path.join(outDir, "watermark.json"), JSON.stringify({ maxTime: result.maxTime }, null, 2) + "\n");
+        writeFileAtomic(watermarkPath, JSON.stringify({ maxTime: result.maxTime }, null, 2) + "\n");
     }
     return result;
 };
