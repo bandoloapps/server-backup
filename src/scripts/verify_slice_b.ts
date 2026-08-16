@@ -23,6 +23,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import crypto from "crypto";
+import sqlite3 from "sqlite3";
 import { BLOB, INTEGER, Sequelize, STRING } from "sequelize";
 import {
     decryptText,
@@ -580,6 +581,31 @@ const test_watermark_never_lowered = async () => {
     }
 };
 
+const test_readonly_open_missing_db = async () => {
+    console.log("\n== exporter: OPEN_READONLY refuses to create missing DB ==");
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "slice-b-ro-"));
+    const missingDb = path.join(tempDir, "does-not-exist.db");
+    const ro = new Sequelize({
+        dialect: "sqlite",
+        storage: missingDb,
+        logging: false,
+        dialectOptions: { mode: sqlite3.OPEN_READONLY },
+    });
+    let threw = false;
+    let code: string | undefined;
+    try {
+        await ro.authenticate();
+    } catch (e: any) {
+        threw = true;
+        code = e.original?.code ?? e.code;
+        // closing a connection that never opened can hang; leave it for GC
+    }
+    check("OPEN_READONLY on missing file throws", threw);
+    check("error code is SQLITE_CANTOPEN", code === "SQLITE_CANTOPEN");
+    check("missing DB was not created", !fs.existsSync(missingDb));
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+};
+
 // ---------- run ----------
 
 const main = async () => {
@@ -603,6 +629,7 @@ const main = async () => {
     test_read_watermark();
     await test_incremental_filter_rejected();
     await test_watermark_never_lowered();
+    await test_readonly_open_missing_db();
 
     console.log(failed === 0 ? "\nVERIFY SLICE B: ALL PASS" : `\nVERIFY SLICE B: ${failed} CHECKS FAILED`);
     process.exit(failed === 0 ? 0 : 1);

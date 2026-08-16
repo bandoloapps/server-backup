@@ -16,7 +16,9 @@
  */
 import crypto from "crypto";
 import fs from "fs";
+import os from "os";
 import path from "path";
+import sqlite3 from "sqlite3";
 import { BLOB, INTEGER, Sequelize, STRING } from "sequelize";
 import { config as dotenvConfig } from "dotenv";
 
@@ -628,7 +630,12 @@ export const main = async (argv: string[]): Promise<void> => {
         watermark: readWatermark(outDir),
     };
 
-    const sequelize = new Sequelize({ dialect: "sqlite", storage: "server.db", logging: false });
+    const sequelize = new Sequelize({
+        dialect: "sqlite",
+        storage: "server.db",
+        logging: false,
+        dialectOptions: { mode: sqlite3.OPEN_READONLY },
+    });
     try {
         const result = await runExport(sequelize, options, outDir);
         console.log(
