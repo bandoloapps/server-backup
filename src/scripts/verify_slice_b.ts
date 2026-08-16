@@ -27,6 +27,7 @@ import sqlite3 from "sqlite3";
 import { BLOB, INTEGER, Sequelize, STRING } from "sequelize";
 import {
     decryptText,
+    getKeyDerivationCount,
     resolveName,
     buildExport,
     readWatermark,
@@ -94,6 +95,24 @@ const test_decrypt = () => {
     // empty blob -> empty string (skipped upstream as empty text)
     check("empty blob decodes to empty string", decryptText(Buffer.alloc(0), undefined) === "");
     check("null blob decodes to empty string", decryptText(null, undefined) === "");
+};
+
+const test_key_derivation_cached = () => {
+    console.log("\n== decryptText: scrypt key derivation is cached ==");
+    const secret = "cache me if you can";
+    const encrypted = encryptWith("cached-pw", Buffer.from(secret, "utf-8"));
+
+    const before = getKeyDerivationCount();
+    for (let i = 0; i < 10; i++) {
+        const d = decryptText(encrypted, "cached-pw");
+        check(`decrypt #${i + 1} succeeds`, d === secret);
+    }
+    const after = getKeyDerivationCount();
+    check("same password derives key exactly once across many rows", after - before === 1);
+
+    // a second password triggers exactly one more derivation
+    decryptText(encryptWith("second-pw", Buffer.from("x")), "second-pw");
+    check("second password triggers exactly one additional derivation", getKeyDerivationCount() - after === 1);
 };
 
 // ---------- Section 2: resolveName ----------
@@ -610,6 +629,7 @@ const test_readonly_open_missing_db = async () => {
 
 const main = async () => {
     test_decrypt();
+    test_key_derivation_cached();
     test_resolve_name();
     test_schema_shape();
     test_name_fallback();

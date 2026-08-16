@@ -135,12 +135,32 @@ export interface ExportResult {
  *   catches ciphertext that happens to survive as invalid UTF-8. Ciphertext
  *   is NEVER silently emitted as message text.
  */
+let keyDerivationCount = 0;
+const keyCache = new Map<string, Buffer>();
+
+const deriveKey = (password: string): Buffer => {
+    keyDerivationCount++;
+    return crypto.scryptSync(password, "salt", 32);
+};
+
+const getKey = (password: string): Buffer => {
+    let key = keyCache.get(password);
+    if (key == null) {
+        key = deriveKey(password);
+        keyCache.set(password, key);
+    }
+    return key;
+};
+
+/** Test hook: number of scrypt derivations performed in this process. */
+export const getKeyDerivationCount = (): number => keyDerivationCount;
+
 export const decryptText = (blob: Buffer | null | undefined, password?: string): string => {
     if (blob == null || blob.length === 0) return "";
 
     let bytes: Buffer;
     if (password) {
-        const key = crypto.scryptSync(password, "salt", 32);
+        const key = getKey(password);
         const decipher = crypto.createDecipheriv("aes256", key, Buffer.alloc(16, 0));
         try {
             // raw BLOB bytes directly — decryptDb.js's Buffer.from(text,'hex')
