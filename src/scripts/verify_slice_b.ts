@@ -470,13 +470,15 @@ const test_run_export_scratch_db = async () => {
     }
 };
 
+// shared canonical message-model definition; mirrors exportMessages.ts
+const defineMessages = (sequelize: Sequelize) => sequelize.define("messages", {
+    channelId: { type: STRING }, userId: { type: STRING },
+    messageId: { type: STRING }, time: { type: INTEGER },
+    text: { type: BLOB },
+}, { timestamps: false, freezeTableName: true });
+
 const await_define = async (sequelize: Sequelize) => {
-    // inline definitions mirroring the exporter's read-only models
-    const messages = sequelize.define("messages", {
-        channelId: { type: STRING }, userId: { type: STRING },
-        messageId: { type: STRING }, time: { type: INTEGER },
-        text: { type: BLOB },
-    }, { timestamps: false, freezeTableName: true });
+    const messages = defineMessages(sequelize);
     const users = sequelize.define("users", {
         userId: { type: STRING, primaryKey: true },
         username: { type: STRING }, displayName: { type: STRING },
@@ -498,11 +500,7 @@ const test_no_cache_tables = async () => {
     let sequelize: Sequelize | null = null;
     try {
         sequelize = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
-        const messages = sequelize.define("messages", {
-            channelId: { type: STRING }, userId: { type: STRING },
-            messageId: { type: STRING }, time: { type: INTEGER },
-            text: { type: BLOB },
-        }, { timestamps: false, freezeTableName: true });
+        const messages = defineMessages(sequelize);
         await sequelize.sync();
         await messages.bulkCreate([{ channelId: "c1", userId: "u1", messageId: "m1", time: 1000, text: Buffer.from("hi") }]);
         await sequelize.close();
@@ -530,11 +528,7 @@ const test_wrong_password_writes_nothing = async () => {
     let sequelize: Sequelize | null = null;
     try {
         sequelize = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
-        const messages = sequelize.define("messages", {
-            channelId: { type: STRING }, userId: { type: STRING },
-            messageId: { type: STRING }, time: { type: INTEGER },
-            text: { type: BLOB },
-        }, { timestamps: false, freezeTableName: true });
+        const messages = defineMessages(sequelize);
         await sequelize.sync();
         await messages.bulkCreate([{ channelId: "c1", userId: "u1", messageId: "m1", time: 1000, text: encryptWith("right", Buffer.from("secret")) }]);
         await sequelize.close();
@@ -562,11 +556,7 @@ const test_atomic_writes = async () => {
     let sequelize: Sequelize | null = null;
     try {
         sequelize = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
-        const messages = sequelize.define("messages", {
-            channelId: { type: STRING }, userId: { type: STRING },
-            messageId: { type: STRING }, time: { type: INTEGER },
-            text: { type: BLOB },
-        }, { timestamps: false, freezeTableName: true });
+        const messages = defineMessages(sequelize);
         await sequelize.sync();
         await messages.bulkCreate([{ channelId: "c1", userId: "u1", messageId: "m1", time: 1000, text: Buffer.from("hi") }]);
         await sequelize.close();
@@ -606,11 +596,7 @@ const test_incremental_filter_rejected = async () => {
     let sequelize: Sequelize | null = null;
     try {
         sequelize = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
-        const messages = sequelize.define("messages", {
-            channelId: { type: STRING }, userId: { type: STRING },
-            messageId: { type: STRING }, time: { type: INTEGER },
-            text: { type: BLOB },
-        }, { timestamps: false, freezeTableName: true });
+        const messages = defineMessages(sequelize);
         await sequelize.sync();
         await messages.bulkCreate([{ channelId: "c1", userId: "u1", messageId: "m1", time: 1000, text: Buffer.from("hi") }]);
         await sequelize.close();
@@ -636,17 +622,13 @@ const test_incremental_filter_rejected = async () => {
 };
 
 const test_watermark_never_lowered = async () => {
-    console.log("\n== runExport: watermark never lowered ==");
+    console.log("\n== runExport: unfiltered watermark never lowered ==");
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "slice-b-wm-lower-"));
     const dbPath = path.join(tempDir, "server.db");
     let sequelize: Sequelize | null = null;
     try {
         sequelize = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
-        const messages = sequelize.define("messages", {
-            channelId: { type: STRING }, userId: { type: STRING },
-            messageId: { type: STRING }, time: { type: INTEGER },
-            text: { type: BLOB },
-        }, { timestamps: false, freezeTableName: true });
+        const messages = defineMessages(sequelize);
         await sequelize.sync();
         await messages.bulkCreate([
             { channelId: "c1", userId: "u1", messageId: "m1", time: 1000, text: Buffer.from("older") },
@@ -708,11 +690,7 @@ const test_entry_guard_symlink = async () => {
     let sequelize: Sequelize | null = null;
     try {
         sequelize = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
-        const messages = sequelize.define("messages", {
-            channelId: { type: STRING }, userId: { type: STRING },
-            messageId: { type: STRING }, time: { type: INTEGER },
-            text: { type: BLOB },
-        }, { timestamps: false, freezeTableName: true });
+        const messages = defineMessages(sequelize);
         await sequelize.sync();
         await messages.bulkCreate([{ channelId: "c1", userId: "u1", messageId: "m1", time: 1000, text: Buffer.from("hi") }]);
         await sequelize.close();
