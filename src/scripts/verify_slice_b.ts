@@ -32,6 +32,7 @@ import {
     buildExport,
     readWatermark,
     runExport,
+    parseArgs,
     ExportInput,
     ExportOptions,
 } from "../export/exportMessages";
@@ -113,6 +114,48 @@ const test_key_derivation_cached = () => {
     // a second password triggers exactly one more derivation
     decryptText(encryptWith("second-pw", Buffer.from("x")), "second-pw");
     check("second password triggers exactly one additional derivation", getKeyDerivationCount() - after === 1);
+};
+
+const expectParseError = (argv: string[], expected: RegExp): boolean => {
+    try {
+        parseArgs(argv);
+        return false;
+    } catch (e: any) {
+        return expected.test(e.message);
+    }
+};
+
+const test_parse_args = () => {
+    console.log("\n== parseArgs contract ==");
+
+    const defaults = parseArgs([]);
+    check("defaults: no filters, outDir 'export', gap 60, incremental false",
+        defaults.channelIds.length === 0 && defaults.from === null && defaults.to === null &&
+        defaults.outDir === "export" && defaults.sessionGapMinutes === 60 && defaults.incremental === false);
+
+    const parsed = parseArgs(["--password", "pw1", "--guild", "G1", "--channels", "c1,c2", "--from", "2024-01-01T00:00:00.000Z", "--to", "2024-02-01T00:00:00.000Z", "--session-gap-minutes", "90", "--incremental", "--out", "outdir"]);
+    check("--password parsed", parsed.password === "pw1");
+    check("--guild parsed", parsed.guildId === "G1");
+    check("--channels parsed as list", JSON.stringify(parsed.channelIds) === JSON.stringify(["c1", "c2"]));
+    check("--from parsed", parsed.from === "2024-01-01T00:00:00.000Z");
+    check("--to parsed", parsed.to === "2024-02-01T00:00:00.000Z");
+    check("--session-gap-minutes parsed", parsed.sessionGapMinutes === 90);
+    check("--incremental parsed", parsed.incremental === true);
+    check("--out parsed", parsed.outDir === "outdir");
+
+    const inline = parseArgs(["--password=inline-pw", "--channels=c3", "--out=inline-out"]);
+    check("inline --flag=value works", inline.password === "inline-pw" && inline.channelIds[0] === "c3" && inline.outDir === "inline-out");
+
+    check("unknown option errors", expectParseError(["--bogus"], /unknown option/));
+    check("--channels missing value errors", expectParseError(["--channels"], /missing value for --channels/));
+    check("--password missing value errors", expectParseError(["--password"], /missing value for --password/));
+    check("--guild missing value errors", expectParseError(["--guild"], /missing value for --guild/));
+    check("--session-gap-minutes missing value errors", expectParseError(["--session-gap-minutes"], /missing value for --session-gap-minutes/));
+    check("--from missing value errors", expectParseError(["--from"], /missing value for --from/));
+    check("--to missing value errors", expectParseError(["--to"], /missing value for --to/));
+    check("--out missing value errors", expectParseError(["--out"], /missing value for --out/));
+    check("--out= empty errors", expectParseError(["--out="], /--out directory path cannot be empty/));
+    check("invalid --session-gap-minutes errors", expectParseError(["--session-gap-minutes", "0"], /invalid --session-gap-minutes/));
 };
 
 // ---------- Section 2: resolveName ----------
@@ -662,6 +705,7 @@ const test_readonly_open_missing_db = async () => {
 const main = async () => {
     test_decrypt();
     test_key_derivation_cached();
+    test_parse_args();
     test_resolve_name();
     test_schema_shape();
     test_name_fallback();

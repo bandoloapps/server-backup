@@ -584,9 +584,13 @@ export const parseArgs = (argv: string[]): ParsedArgs => {
     };
     // nextValue <i> <eq> — the value for the option at argv[i]; --flag=value
     // uses the inline part, otherwise consume the following argument.
-    const nextValue = (i: number, eq: number): { value?: string; next: number } => {
+    const nextValue = (i: number, eq: number, flag: string): { value: string; next: number } => {
         if (eq >= 0) return { value: argv[i].slice(eq + 1), next: i };
-        return { value: argv[i + 1], next: i + 1 };
+        const value = argv[i + 1];
+        if (value == null || value.startsWith("--")) {
+            throw new Error(`missing value for ${flag}`);
+        }
+        return { value, next: i + 1 };
     };
     for (let i = 0; i < argv.length; i++) {
         const arg = argv[i];
@@ -594,38 +598,38 @@ export const parseArgs = (argv: string[]): ParsedArgs => {
         const name = eq >= 0 ? arg.slice(0, eq) : arg;
         switch (name) {
             case "--password": {
-                const v = nextValue(i, eq);
+                const v = nextValue(i, eq, "--password");
                 out.password = v.value;
                 i = v.next;
                 break;
             }
             case "--guild": {
-                const v = nextValue(i, eq);
+                const v = nextValue(i, eq, "--guild");
                 out.guildId = v.value;
                 i = v.next;
                 break;
             }
             case "--channels": {
-                const v = nextValue(i, eq);
-                out.channelIds = (v.value ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+                const v = nextValue(i, eq, "--channels");
+                out.channelIds = v.value.split(",").map((s) => s.trim()).filter(Boolean);
                 i = v.next;
                 break;
             }
             case "--from": {
-                const v = nextValue(i, eq);
-                out.from = v.value ?? null;
+                const v = nextValue(i, eq, "--from");
+                out.from = v.value;
                 i = v.next;
                 break;
             }
             case "--to": {
-                const v = nextValue(i, eq);
-                out.to = v.value ?? null;
+                const v = nextValue(i, eq, "--to");
+                out.to = v.value;
                 i = v.next;
                 break;
             }
             case "--incremental": out.incremental = true; break;
             case "--session-gap-minutes": {
-                const v = nextValue(i, eq);
+                const v = nextValue(i, eq, "--session-gap-minutes");
                 const n = Number(v.value);
                 if (!Number.isFinite(n) || n <= 0) throw new Error(`invalid --session-gap-minutes: '${v.value}'`);
                 out.sessionGapMinutes = n;
@@ -633,8 +637,9 @@ export const parseArgs = (argv: string[]): ParsedArgs => {
                 break;
             }
             case "--out": {
-                const v = nextValue(i, eq);
-                out.outDir = v.value ?? "export";
+                const v = nextValue(i, eq, "--out");
+                if (v.value.length === 0) throw new Error("--out directory path cannot be empty");
+                out.outDir = v.value;
                 i = v.next;
                 break;
             }
