@@ -550,11 +550,17 @@ export const runExport = async (
 
     const result = buildExport({ messages: decrypted, users, channels }, options);
 
-    // defensive guard: a filtered or otherwise regressed export must never
-    // lower the watermark and silently hide messages from future runs.
-    // Check before writing any output so a regression leaves files untouched.
+    // A filtered export must NEVER touch the watermark sidecar: its maxTime is
+    // only a subset, and writing it would cause later unfiltered --incremental
+    // runs to skip messages that were never exported. Only unfiltered exports
+    // (full or incremental) may advance the watermark.
+    const isFiltered = options.channelIds.length > 0 || options.from != null || options.to != null;
+
+    // defensive guard: an unfiltered export whose emitted maxTime is lower than
+    // the existing watermark would indicate a pruned/cleared DB. Reject before
+    // writing any output so the sidecar stays intact.
     const existingWatermark = readWatermark(outDir);
-    if (result.maxTime != null && existingWatermark != null && result.maxTime < existingWatermark) {
+    if (!isFiltered && result.maxTime != null && existingWatermark != null && result.maxTime < existingWatermark) {
         throw new Error(
             `watermark regression rejected: new maxTime (${result.maxTime}) is lower ` +
             `than the existing watermark (${existingWatermark})`
@@ -565,7 +571,7 @@ export const runExport = async (
     const messagesPath = path.join(outDir, "messages.json");
     const watermarkPath = path.join(outDir, "watermark.json");
     writeFileAtomic(messagesPath, JSON.stringify(result.output, null, 2) + "\n");
-    if (result.maxTime != null) {
+    if (!isFiltered && result.maxTime != null) {
         writeFileAtomic(watermarkPath, JSON.stringify({ maxTime: result.maxTime }, null, 2) + "\n");
     }
     return result;

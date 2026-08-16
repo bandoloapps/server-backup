@@ -710,6 +710,79 @@ const test_entry_guard_symlink = async () => {
     }
 };
 
+const test_filtered_export_preserves_watermark = async () => {
+    console.log("\n== runExport: filtered full export leaves existing watermark untouched ==");
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "slice-b-filter-wm-"));
+    const dbPath = path.join(tempDir, "server.db");
+    let sequelize: Sequelize | null = null;
+    try {
+        sequelize = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
+        const { messages, users, channels } = await await_define(sequelize);
+        await messages.bulkCreate([
+            { channelId: "c1", userId: "u1", messageId: "m1", time: 1000, text: Buffer.from("c1 older") },
+            { channelId: "c2", userId: "u1", messageId: "m2", time: 9000, text: Buffer.from("c2 newer") },
+        ]);
+        await users.bulkCreate([{ userId: "u1", username: "alice", displayName: "Alice", globalName: null }]);
+        await channels.bulkCreate([
+            { channelId: "c1", name: "general", type: "text", parentId: null },
+            { channelId: "c2", name: "other", type: "text", parentId: null },
+        ]);
+        await sequelize.close();
+        sequelize = null;
+
+        const reader = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
+        const outDir = path.join(tempDir, "export");
+        fs.mkdirSync(outDir, { recursive: true });
+        const watermarkContent = JSON.stringify({ maxTime: 9999 }, null, 2) + "\n";
+        fs.writeFileSync(path.join(outDir, "watermark.json"), watermarkContent);
+
+        const result = await runExport(reader, baseOptions({ channelIds: ["c1"] }), outDir);
+        await reader.close();
+
+        check("filtered export succeeds", result.emittedCount === 1);
+        check("filtered export emits the requested subset", result.output.sessions[0].timeline[0].id === "m1");
+        const wmBytesAfter = fs.readFileSync(path.join(outDir, "watermark.json"), "utf-8");
+        check("existing watermark.json bytes are unchanged", wmBytesAfter === watermarkContent);
+    } finally {
+        if (sequelize) { try { await sequelize.close(); } catch {} }
+        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    }
+};
+
+const test_filtered_export_creates_no_watermark = async () => {
+    console.log("\n== runExport: filtered full export does not create watermark.json ==");
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "slice-b-filter-nowm-"));
+    const dbPath = path.join(tempDir, "server.db");
+    let sequelize: Sequelize | null = null;
+    try {
+        sequelize = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
+        const { messages, users, channels } = await await_define(sequelize);
+        await messages.bulkCreate([
+            { channelId: "c1", userId: "u1", messageId: "m1", time: 1000, text: Buffer.from("c1") },
+            { channelId: "c2", userId: "u1", messageId: "m2", time: 2000, text: Buffer.from("c2") },
+        ]);
+        await users.bulkCreate([{ userId: "u1", username: "alice", displayName: "Alice", globalName: null }]);
+        await channels.bulkCreate([
+            { channelId: "c1", name: "general", type: "text", parentId: null },
+            { channelId: "c2", name: "other", type: "text", parentId: null },
+        ]);
+        await sequelize.close();
+        sequelize = null;
+
+        const reader = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
+        const outDir = path.join(tempDir, "export");
+        const result = await runExport(reader, baseOptions({ channelIds: ["c1"] }), outDir);
+        await reader.close();
+
+        check("filtered export succeeds", result.emittedCount === 1);
+        check("messages.json written", fs.existsSync(path.join(outDir, "messages.json")));
+        check("watermark.json NOT created by filtered export", !fs.existsSync(path.join(outDir, "watermark.json")));
+    } finally {
+        if (sequelize) { try { await sequelize.close(); } catch {} }
+        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    }
+};
+
 // ---------- run ----------
 
 const main = async () => {
@@ -736,6 +809,8 @@ const main = async () => {
     test_read_watermark();
     await test_incremental_filter_rejected();
     await test_watermark_never_lowered();
+    await test_filtered_export_preserves_watermark();
+    await test_filtered_export_creates_no_watermark();
     await test_readonly_open_missing_db();
     await test_entry_guard_symlink();
 
