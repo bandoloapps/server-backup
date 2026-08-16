@@ -424,7 +424,8 @@ export const buildExport = (input: ExportInput, options: ExportOptions): ExportR
 const writeFileAtomic = (targetPath: string, data: string): void => {
     const dir = path.dirname(targetPath);
     const tmp = path.join(dir, `.tmp-${path.basename(targetPath)}-${process.pid}-${Date.now()}`);
-    const fd = fs.openSync(tmp, "w");
+    // decrypted plaintext: restrict to owner read/write only
+    const fd = fs.openSync(tmp, "w", 0o600);
     try {
         fs.writeSync(fd, data);
         fs.fsyncSync(fd);
@@ -567,7 +568,7 @@ export const runExport = async (
         );
     }
 
-    fs.mkdirSync(outDir, { recursive: true });
+    fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
     const messagesPath = path.join(outDir, "messages.json");
     const watermarkPath = path.join(outDir, "watermark.json");
     writeFileAtomic(messagesPath, JSON.stringify(result.output, null, 2) + "\n");

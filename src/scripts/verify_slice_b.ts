@@ -783,6 +783,37 @@ const test_filtered_export_creates_no_watermark = async () => {
     }
 };
 
+const checkPosixMode = (name: string, filePath: string, expected: number) => {
+    if (process.platform === "win32") { console.log(`SKIP (win32): ${name}`); return; }
+    check(name, (fs.statSync(filePath).mode & 0o777) === expected);
+};
+
+const test_output_permissions = async () => {
+    console.log("\n== runExport: output directory 0700 and files 0600 ==");
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "slice-b-perms-"));
+    const dbPath = path.join(tempDir, "server.db");
+    let sequelize: Sequelize | null = null;
+    try {
+        sequelize = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
+        const { messages } = await await_define(sequelize);
+        await messages.bulkCreate([{ channelId: "c1", userId: "u1", messageId: "m1", time: 1000, text: Buffer.from("hi") }]);
+        await sequelize.close();
+        sequelize = null;
+
+        const reader = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
+        const outDir = path.join(tempDir, "export");
+        await runExport(reader, baseOptions(), outDir);
+        await reader.close();
+
+        checkPosixMode("outDir is 0700", outDir, 0o700);
+        checkPosixMode("messages.json is 0600", path.join(outDir, "messages.json"), 0o600);
+        checkPosixMode("watermark.json is 0600", path.join(outDir, "watermark.json"), 0o600);
+    } finally {
+        if (sequelize) { try { await sequelize.close(); } catch {} }
+        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    }
+};
+
 // ---------- run ----------
 
 const main = async () => {
@@ -811,6 +842,7 @@ const main = async () => {
     await test_watermark_never_lowered();
     await test_filtered_export_preserves_watermark();
     await test_filtered_export_creates_no_watermark();
+    await test_output_permissions();
     await test_readonly_open_missing_db();
     await test_entry_guard_symlink();
 
