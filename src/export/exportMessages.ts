@@ -689,10 +689,17 @@ export const main = async (argv: string[]): Promise<void> => {
 };
 
 // run only when this file is the entry point, so verify scripts can import the
-// pure functions without triggering an export
-if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
-    main(process.argv.slice(2)).catch((err: any) => {
-        console.error(`export failed: ${err?.message ?? err}`);
-        process.exitCode = 1;
-    });
+// pure functions without triggering an export. realpathSync handles symlinks
+// (e.g., /Users/saff/Dev -> /Volumes/Avalonia/...), which path.resolve does not.
+if (process.argv[1]) {
+    try {
+        if (fs.realpathSync(process.argv[1]) === fs.realpathSync(__filename)) {
+            main(process.argv.slice(2)).catch((err: any) => {
+                console.error(`export failed: ${err?.message ?? err}`);
+                process.exitCode = 1;
+            });
+        }
+    } catch {
+        // process.argv[1] does not resolve: not a valid invocation of this file
+    }
 }

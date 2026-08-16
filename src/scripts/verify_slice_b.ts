@@ -24,6 +24,7 @@ import os from "os";
 import path from "path";
 import crypto from "crypto";
 import sqlite3 from "sqlite3";
+import { execFileSync } from "child_process";
 import { BLOB, INTEGER, Sequelize, STRING } from "sequelize";
 import {
     decryptText,
@@ -700,6 +701,37 @@ const test_readonly_open_missing_db = async () => {
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
 };
 
+const test_entry_guard_symlink = async () => {
+    console.log("\n== CLI entry guard resolves symlinks ==");
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "slice-b-symlink-"));
+    const dbPath = path.join(tempDir, "server.db");
+    let sequelize: Sequelize | null = null;
+    try {
+        sequelize = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
+        const messages = sequelize.define("messages", {
+            channelId: { type: STRING }, userId: { type: STRING },
+            messageId: { type: STRING }, time: { type: INTEGER },
+            text: { type: BLOB },
+        }, { timestamps: false, freezeTableName: true });
+        await sequelize.sync();
+        await messages.bulkCreate([{ channelId: "c1", userId: "u1", messageId: "m1", time: 1000, text: Buffer.from("hi") }]);
+        await sequelize.close();
+        sequelize = null;
+
+        const realExporter = path.join(__dirname, "..", "export", "exportMessages.js");
+        const symlinkExporter = path.join(tempDir, "exporter-symlink.js");
+        fs.symlinkSync(realExporter, symlinkExporter);
+
+        const outDir = path.join(tempDir, "export");
+        const stdout = execFileSync(process.execPath, [symlinkExporter, "--out", outDir], { cwd: tempDir, encoding: "utf-8" });
+        check("exporter runs when invoked through a symlink", /exported 1 message/i.test(stdout));
+        check("messages.json produced via symlink", fs.existsSync(path.join(outDir, "messages.json")));
+    } finally {
+        if (sequelize) { try { await sequelize.close(); } catch {} }
+        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    }
+};
+
 // ---------- run ----------
 
 const main = async () => {
@@ -727,6 +759,7 @@ const main = async () => {
     await test_incremental_filter_rejected();
     await test_watermark_never_lowered();
     await test_readonly_open_missing_db();
+    await test_entry_guard_symlink();
 
     console.log(failed === 0 ? "\nVERIFY SLICE B: ALL PASS" : `\nVERIFY SLICE B: ${failed} CHECKS FAILED`);
     process.exit(failed === 0 ? 0 : 1);
