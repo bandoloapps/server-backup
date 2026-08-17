@@ -473,12 +473,17 @@ const defineExportModels = (sequelize: Sequelize) => {
     return { messages, users, channels };
 };
 
-// no sequelize.sync(): a missing table means "empty cache", never "create it"
+// no sequelize.sync(): a missing table means "empty cache", never "create it".
+// Only an intentionally missing table is treated as an empty result; ANY other
+// read error (e.g. a "no such column" schema drift on a healthy DB, or a
+// table-level read failure) must propagate so the export fails loudly instead
+// of silently writing an empty messages.json with exit 0 (data-loss risk).
 const safeFindAll = async (model: any): Promise<any[]> => {
     try {
         return await model.findAll({ raw: true });
     } catch (err: any) {
-        if (err?.original?.code === "SQLITE_ERROR" || /no such table/.test(String(err?.message ?? ""))) {
+        const message = String(err?.original?.message ?? err?.message ?? "");
+        if (/no such table/i.test(message)) {
             return [];
         }
         throw err;

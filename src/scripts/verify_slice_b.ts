@@ -521,6 +521,48 @@ const test_no_cache_tables = async () => {
     }
 };
 
+const test_schema_drift_propagates = async () => {
+    console.log("\n== runExport: schema drift on a healthy DB propagates (never exports empty) ==");
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "slice-b-drift-"));
+    const dbPath = path.join(tempDir, "server.db");
+    let sequelize: Sequelize | null = null;
+    try {
+        sequelize = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
+        // A healthy DB whose messages table drifted from the exporter's inline
+        // model: the text column is missing (renamed to body). This is NOT a
+        // missing table, so safeFindAll must propagate the SQLITE_ERROR instead
+        // of treating it as an empty cache and writing an empty export.
+        await sequelize.query(
+            "CREATE TABLE messages (channelId TEXT, userId TEXT, messageId TEXT, time INTEGER, body BLOB)"
+        );
+        await sequelize.query(
+            "INSERT INTO messages (channelId, userId, messageId, time, body) VALUES ('c1','u1','m1',1000, X'6869')"
+        );
+        await sequelize.close();
+        sequelize = null;
+
+        const reader = new Sequelize({ dialect: "sqlite", storage: dbPath, logging: false });
+        const outDir = path.join(tempDir, "export");
+        let threw = false;
+        let message = "";
+        try {
+            await runExport(reader, baseOptions(), outDir);
+        } catch (e: any) {
+            threw = true;
+            message = e?.message ?? "";
+        }
+        await reader.close();
+
+        check("schema drift throws instead of exporting empty", threw);
+        check("error names the missing column", /no such column/i.test(message));
+        check("messages.json NOT written on schema drift", !fs.existsSync(path.join(outDir, "messages.json")));
+        check("watermark.json NOT written on schema drift", !fs.existsSync(path.join(outDir, "watermark.json")));
+    } finally {
+        if (sequelize) { try { await sequelize.close(); } catch {} }
+        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    }
+};
+
 const test_wrong_password_writes_nothing = async () => {
     console.log("\n== runExport: wrong password writes no output ==");
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "slice-b-badpw-"));
@@ -835,6 +877,7 @@ const main = async () => {
     test_empty_db();
     await test_run_export_scratch_db();
     await test_no_cache_tables();
+    await test_schema_drift_propagates();
     await test_wrong_password_writes_nothing();
     await test_atomic_writes();
     test_read_watermark();
