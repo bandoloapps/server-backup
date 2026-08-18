@@ -367,8 +367,35 @@ const main = async () => {
         }
         check("sync throw from upsert swallowed", !sync_threw);
 
+        // Regression: a re-crawl (INITIAL_BACKUP_FORCE_FRESH) processes messages that already
+        // exist in the DB. The cache upsert must run BEFORE the duplicate guard, otherwise
+        // existing messages never populate users/channels and export falls back to unknown (<id>).
+        // See save_msg_to_db ordering fix.
+        const recrawl_content = {
+            channelId: "ch-e2e",
+            userId: "u-recrawl",
+            messageId: "msg-e2e-existing",
+            time: 1700000000000,
+            text: "existing message",
+            attachments: emptyAttachments,
+            thread: null,
+            author: { username: "recrawl_user", displayName: "Recrawl User", globalName: "Recrawl Global" },
+            channel: { name: "recrawl-channel", type: "text", parentId: null }
+        } as any;
+        // first save: message + cache rows land normally
+        await save_msg_to_db(recrawl_content, messages_model, attachments_model, users_model, channels_model);
+        // simulate the re-crawl: same messageId already exists, save_msg_to_db returns at the
+        // duplicate guard; the cache upsert must still run before that guard.
+        await save_msg_to_db(recrawl_content, messages_model, attachments_model, users_model, channels_model);
+        const recrawl_msg_count = await messages_model.count({ where: { messageId: "msg-e2e-existing" } });
+        check("duplicate save does not insert a second message row", recrawl_msg_count === 1);
+        const recrawl_user: any = await users_model.findByPk("u-recrawl");
+        check("duplicate save still populates users cache (regression)", recrawl_user?.username === "recrawl_user");
+        const recrawl_ch: any = await channels_model.findByPk("ch-e2e");
+        check("duplicate save still populates channels cache (regression)", recrawl_ch?.name === "recrawl-channel");
+
         const count_final = await messages_model.count();
-        check("messages COUNT unchanged after all phases", count_final === 7);
+        check("messages COUNT unchanged after all phases", count_final === 8);
 
         console.log(failed === 0
             ? `\nALL CHECKS PASSED (db: ${DB_PATH})`

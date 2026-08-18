@@ -74,7 +74,13 @@ export const get_msg_content = async (msg: Message) => {
 export const save_msg_to_db = async (raw_data: ExtractedContent, messages_model: any, attachments_model: any, users_model: any, channels_model: any) => {
     try{
         const {channelId, messageId, userId, time, text, attachments: attachments_raw, thread} = raw_data;
-        
+
+        //cache user/channel/thread names — a cache failure never blocks the message save (D4).
+        //Run BEFORE the duplicate guard so a re-crawl (INITIAL_BACKUP_FORCE_FRESH) re-populates the
+        //users/channels cache for messages that already exist; otherwise the cache only ever fills
+        //for brand-new messages and existing rows never resolve their names on export.
+        await upsert_cache_for_message(raw_data, users_model, channels_model);
+
         //making sure we arent working on a duplicate
         const previous_message = await messages_model.findOne({where: {messageId}});
         if(previous_message) return;
@@ -82,9 +88,6 @@ export const save_msg_to_db = async (raw_data: ExtractedContent, messages_model:
         //ignoring from configs
         if(ignore_channels.includes(channelId)) return;
         if(ignore_users.includes(userId)) return;
-
-        //cache user/channel/thread names — a cache failure never blocks the message save (D4)
-        await upsert_cache_for_message(raw_data, users_model, channels_model);
 
         const attachments = Array.from(attachments_raw);
 

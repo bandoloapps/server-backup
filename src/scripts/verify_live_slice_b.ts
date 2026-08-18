@@ -9,8 +9,8 @@
  *   - full run: exit 0, schemaVersion "1", mode "full", guildId from a
  *     minimal .env (GUILD_ID), users/channels maps, sessions with
  *     start/end/channelIds/timeline/topics
- *   - the real DB has NO users/channels cache tables -> unknown (<id>)
- *     fallback on every entry, never a crash or skip
+ *  - name resolution: names in the users/channels cache resolve; names not in
+ *    the cache fall back to `unknown (<id>)`, never a crash or skip
  *   - empty/whitespace-only texts skipped (313 rows -> 263 emitted)
  *   - entries sorted by (time, messageId), no messageId duplicates
  *   - watermark.json = max emitted time
@@ -103,10 +103,28 @@ const main = async () => {
         // total emitted = DB rows - empty/whitespace texts (real DB has no cache tables)
         check(`emitted count ${allEntries.length} == ${expectedEmitted}`, allEntries.length === expectedEmitted);
 
-        // no cache tables -> unknown (<id>) fallback everywhere, no crash/skip
-        const fallbackOk = allEntries.every((e: any) =>
-            e.author === `unknown (${e.authorId})` && e.channel === `unknown (${e.channelId})`);
-        check("unknown (<id>) fallback on every author/channel (no cache tables)", fallbackOk);
+        // Name resolution contract: a name that IS in the users/channels cache must resolve to
+        // its cached value; a name NOT in the cache must fall back to `unknown (<id>)` and never
+        // crash or skip the message. (The real DB may or may not have a populated cache; derive
+        // the expectation from the copied DB rather than assuming one fixed state.)
+        const cacheDb = new Sequelize({ dialect: "sqlite", storage: copiedDb, logging: false });
+        const knownUsers = new Set<string>();
+        const knownChannels = new Set<string>();
+        try {
+            const uRows = await cacheDb.query<{ userId: string }>("SELECT DISTINCT userId FROM users", { type: QueryTypes.SELECT });
+            for (const r of uRows) knownUsers.add(String(r.userId));
+        } catch { /* no users table — cache empty */ }
+        try {
+            const cRows = await cacheDb.query<{ channelId: string }>("SELECT DISTINCT channelId FROM channels", { type: QueryTypes.SELECT });
+            for (const r of cRows) knownChannels.add(String(r.channelId));
+        } catch { /* no channels table — cache empty */ }
+        await cacheDb.close();
+        const fallbackOk = allEntries.every((e: any) => {
+            const authorOk = knownUsers.has(e.authorId) ? e.author !== `unknown (${e.authorId})` : e.author === `unknown (${e.authorId})`;
+            const channelOk = knownChannels.has(e.channelId) ? e.channel !== `unknown (${e.channelId})` : e.channel === `unknown (${e.channelId})`;
+            return authorOk && channelOk;
+        });
+        check("names resolve from cache or fall back to unknown (<id>) without crash/skip", fallbackOk);
 
         // entry field contract
         const entryOk = allEntries.every((e: any) =>
