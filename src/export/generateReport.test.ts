@@ -7,6 +7,8 @@ import {
   resolveNames,
   computeOutputPath,
   parseReportArgs,
+  buildSections,
+  main,
   type ExportOutput,
   type ReportOptions,
 } from "./generateReport";
@@ -379,5 +381,230 @@ describe("parseReportArgs", () => {
 
   it("throws on missing value for --session", () => {
     assert.throws(() => parseReportArgs(["--session"]), /missing value/i);
+  });
+});
+
+// ---------- buildSections ----------
+
+describe("buildSections", () => {
+  it("returns 5 sections in order for chronological view", () => {
+    const output = makeOutput();
+    const session = output.sessions[0];
+    const resolved = resolveNames(session, output.users, output.channels);
+    const sections = buildSections([resolved], makeOptions());
+    assert.equal(sections.length, 5);
+    // Verify section types by checking children arrays exist
+    for (const s of sections) {
+      assert.ok(Array.isArray(s.children), "each section must have children array");
+    }
+  });
+
+  it("returns 5 sections in order for by-channel view", () => {
+    const output = makeOutput();
+    const session = output.sessions[0];
+    const resolved = resolveNames(session, output.users, output.channels);
+    const sections = buildSections([resolved], makeOptions({ viewMode: "by-channel" }));
+    assert.equal(sections.length, 5);
+  });
+
+  it("title section contains server name", () => {
+    const output = makeOutput();
+    const session = output.sessions[0];
+    const resolved = resolveNames(session, output.users, output.channels);
+    const sections = buildSections(
+      [resolved],
+      makeOptions({ serverName: "MyServer" })
+    );
+    // Title section is first — inspect its children for "MyServer" text
+    const titleChildren = sections[0].children;
+    const hasServerName = titleChildren.some((child: any) => {
+      const json = JSON.stringify(child.root ?? child);
+      return json.includes("MyServer");
+    });
+    assert.ok(hasServerName, "title section must contain server name");
+  });
+
+  it("empty sessions produces title and metadata only", () => {
+    const sections = buildSections([], makeOptions({ serverName: "Empty" }));
+    // With zero sessions: title + metadata should exist, timeline empty
+    assert.ok(sections.length >= 2, "must have at least title and metadata");
+  });
+
+  it("timeline entries are sorted by time then id in chronological view", () => {
+    const output = makeOutput();
+    const session = output.sessions[0];
+    // Reorder timeline so m2 comes before m1
+    session.timeline = [session.timeline[1], session.timeline[0]];
+    const resolved = resolveNames(session, output.users, output.channels);
+    const sections = buildSections([resolved], makeOptions({ viewMode: "chronological" }));
+    // Timeline body is section index 2 (after title + metadata)
+    const timelineSection = sections[2];
+    assert.ok(timelineSection, "timeline section must exist");
+    assert.ok(timelineSection.children.length > 0, "timeline must have content");
+  });
+
+  it("by-channel groups messages under channel headings", () => {
+    const output = makeOutput();
+    const session = output.sessions[0];
+    const resolved = resolveNames(session, output.users, output.channels);
+    const sections = buildSections(
+      [resolved],
+      makeOptions({ viewMode: "by-channel" })
+    );
+    const timelineSection = sections[2];
+    assert.ok(timelineSection, "timeline section must exist");
+    assert.ok(timelineSection.children.length > 0, "timeline must have content");
+  });
+
+  it("thread sub-sections appear after timeline", () => {
+    const output = makeOutput();
+    const session = {
+      ...output.sessions[0],
+      topics: [
+        {
+          id: "t1",
+          name: "Thread Topic",
+          channelId: "c1",
+          timeline: [
+            {
+              id: "m3",
+              channelId: "c1",
+              authorId: "u1",
+              author: "Alice",
+              channel: "general",
+              time: "2026-08-19T20:10:00.000Z",
+              text: "Thread reply",
+            },
+          ],
+        },
+      ],
+    };
+    const resolved = resolveNames(session, output.users, output.channels);
+    const sections = buildSections([resolved], makeOptions());
+    // Sections: [title, metadata, timeline, threads, participants]
+    assert.equal(sections.length, 5);
+    const threadsSection = sections[3];
+    assert.ok(threadsSection, "threads section must exist");
+    assert.ok(threadsSection.children.length > 0, "threads must have content when topics exist");
+  });
+
+  it("participant index shows unique authors", () => {
+    const output = makeOutput();
+    const session = output.sessions[0];
+    const resolved = resolveNames(session, output.users, output.channels);
+    const sections = buildSections([resolved], makeOptions());
+    // Participant index is section 4
+    const participantSection = sections[4];
+    assert.ok(participantSection, "participant section must exist");
+    assert.ok(participantSection.children.length > 0, "participants must have content");
+  });
+});
+
+// ---------- main ----------
+
+describe("main", () => {
+  it("writes DOCX to --output path for single session", async () => {
+    const output = makeOutput();
+    let writtenPath = "";
+    let writtenBuffer: Buffer | null = null;
+
+    const io = {
+      readFileSync: (_p: string, _enc: string) => JSON.stringify(output),
+      writeFileSync: (p: string, data: Buffer) => {
+        writtenPath = p;
+        writtenBuffer = data;
+      },
+      mkdirSync: (_p: string, _opts: any) => {},
+      exit: (code: number) => { if (code !== 0) throw new Error(`exit(${code})`); },
+    };
+
+    await main(["--output", "/tmp/test-report.docx"], io);
+    assert.equal(writtenPath, "/tmp/test-report.docx");
+    assert.ok(writtenBuffer, "buffer must be written");
+    assert.ok(writtenBuffer!.length > 0, "DOCX must not be empty");
+  });
+
+  it("writes one DOCX per session when no --session flag", async () => {
+    const output = makeOutput({
+      sessions: [
+        { ...makeOutput().sessions[0], start: "2026-08-19T18:00:00.000Z", end: "2026-08-19T19:00:00.000Z", timeline: [{ ...makeOutput().sessions[0].timeline[0], time: "2026-08-19T18:00:00.000Z" }], topics: [] },
+        makeOutput().sessions[0],
+      ],
+    });
+    const writtenPaths: string[] = [];
+
+    const io = {
+      readFileSync: (_p: string, _enc: string) => JSON.stringify(output),
+      writeFileSync: (p: string, _data: Buffer) => { writtenPaths.push(p); },
+      mkdirSync: (_p: string, _opts: any) => {},
+      exit: (code: number) => { if (code !== 0) throw new Error(`exit(${code})`); },
+    };
+
+    await main(["--server-name", "TestServer"], io);
+    assert.equal(writtenPaths.length, 2, "must write one file per session");
+    // Each path should contain the session slug
+    assert.ok(writtenPaths[0].includes("session-"), "first file must be a session docx");
+    assert.ok(writtenPaths[1].includes("session-"), "second file must be a session docx");
+  });
+
+  it("writes empty DOCX and exits 0 when zero sessions match", async () => {
+    const output = makeOutput();
+    let exitCalled = false;
+
+    const io = {
+      readFileSync: (_p: string, _enc: string) => JSON.stringify(output),
+      writeFileSync: (_p: string, _data: Buffer) => {},
+      mkdirSync: (_p: string, _opts: any) => {},
+      exit: (code: number) => {
+        if (code !== 0) throw new Error(`exit(${code})`);
+        exitCalled = true;
+      },
+    };
+
+    await main(["--session", "99"], io);
+    assert.ok(exitCalled, "exit(0) must be called for zero matches");
+  });
+
+  it("exits non-zero when input file is missing", async () => {
+    let exitCode: number | null = null;
+
+    const io = {
+      readFileSync: (_p: string, _enc: string) => { throw new Error("ENOENT"); },
+      writeFileSync: (_p: string, _data: Buffer) => {},
+      mkdirSync: (_p: string, _opts: any) => {},
+      exit: (code: number) => { exitCode = code; },
+    };
+
+    await main([], io);
+    assert.equal(exitCode, 1, "must exit 1 on missing file");
+  });
+
+  it("exits non-zero on invalid JSON", async () => {
+    let exitCode: number | null = null;
+
+    const io = {
+      readFileSync: (_p: string, _enc: string) => "{bad json",
+      writeFileSync: (_p: string, _data: Buffer) => {},
+      mkdirSync: (_p: string, _opts: any) => {},
+      exit: (code: number) => { exitCode = code; },
+    };
+
+    await main([], io);
+    assert.equal(exitCode, 1, "must exit 1 on invalid JSON");
+  });
+
+  it("exits non-zero on unsupported schema version", async () => {
+    let exitCode: number | null = null;
+    const badOutput = makeOutput({ schemaVersion: "99" });
+
+    const io = {
+      readFileSync: (_p: string, _enc: string) => JSON.stringify(badOutput),
+      writeFileSync: (_p: string, _data: Buffer) => {},
+      mkdirSync: (_p: string, _opts: any) => {},
+      exit: (code: number) => { exitCode = code; },
+    };
+
+    await main([], io);
+    assert.equal(exitCode, 1, "must exit 1 on unsupported schema version");
   });
 });

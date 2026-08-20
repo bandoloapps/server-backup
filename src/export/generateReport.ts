@@ -1,13 +1,25 @@
 /**
- * DOCX session report generator — pure functions slice (PR 1).
+ * DOCX session report generator.
  *
  * Reads `messages.json` output from the export pipeline and produces a
- * Google-Docs-compatible `.docx` via the `docx` npm package. This module
- * contains only types and pure functions (no filesystem I/O).
- *
- * PR 2 will add `buildSections`, `main()`, and the `docx` dependency.
+ * Google-Docs-compatible `.docx` via the `docx` npm package.
+ * Pure functions for TDD; main() accepts DI for I/O.
  */
+import fs from "fs";
 import path from "path";
+import {
+  Document,
+  Packer,
+  Paragraph,
+  TextRun,
+  HeadingLevel,
+  Table,
+  TableRow,
+  TableCell,
+  WidthType,
+  AlignmentType,
+  type SectionProperties,
+} from "docx";
 import { ExportOutput, Session } from "./exportMessages";
 
 // Re-export for consumers
@@ -29,6 +41,12 @@ export interface ReportOptions {
 
 export interface ParsedReportArgs extends ReportOptions {
   inputPath: string;
+}
+
+/** A logical document section — children are docx element instances. */
+export interface DocxSection {
+  children: (Paragraph | Table)[];
+  properties?: SectionProperties;
 }
 
 // ---------- constants ----------
@@ -296,4 +314,365 @@ function formatSlug(isoTime: string): string {
   const hh = String(d.getUTCHours()).padStart(2, "0");
   const min = String(d.getUTCMinutes()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}_${hh}${min}`;
+}
+
+// ---------- section helpers ----------
+
+/**
+ * Title page: server name + session span (first → last message time).
+ */
+function titlePage(
+  serverName: string,
+  sessions: Session[]
+): (Paragraph | Table)[] {
+  const children: (Paragraph | Table)[] = [];
+
+  children.push(
+    new Paragraph({
+      children: [new TextRun({ text: serverName, bold: true, size: 48 })],
+      heading: HeadingLevel.TITLE,
+      alignment: AlignmentType.CENTER,
+    })
+  );
+
+  if (sessions.length > 0) {
+    const first = sessions[0].start;
+    const last = sessions[sessions.length - 1].end;
+    const spanText =
+      sessions.length === 1
+        ? `${first} — ${last}`
+        : `${sessions.length} sessions: ${first} — ${last}`;
+    children.push(
+      new Paragraph({
+        children: [new TextRun({ text: spanText, size: 24 })],
+        alignment: AlignmentType.CENTER,
+      })
+    );
+  } else {
+    children.push(
+      new Paragraph({
+        children: [new TextRun({ text: "No sessions", size: 24 })],
+        alignment: AlignmentType.CENTER,
+      })
+    );
+  }
+
+  return children;
+}
+
+/**
+ * Metadata: generated-at, view mode, filter description, session count.
+ */
+function metadata(
+  generatedAt: string,
+  viewMode: ViewMode,
+  filterDesc: string,
+  sessionCount: number
+): (Paragraph | Table)[] {
+  return [
+    new Paragraph({
+      children: [
+        new TextRun({ text: "Generated: ", bold: true }),
+        new TextRun(generatedAt),
+      ],
+    }),
+    new Paragraph({
+      children: [
+        new TextRun({ text: "View: ", bold: true }),
+        new TextRun(viewMode),
+      ],
+    }),
+    new Paragraph({
+      children: [
+        new TextRun({ text: "Filter: ", bold: true }),
+        new TextRun(filterDesc || "none"),
+      ],
+    }),
+    new Paragraph({
+      children: [
+        new TextRun({ text: "Sessions: ", bold: true }),
+        new TextRun(String(sessionCount)),
+      ],
+    }),
+  ];
+}
+
+/**
+ * Timeline body: messages rendered per view mode.
+ * Chronological: single merged timeline sorted by (time, id).
+ * By-channel: H2 per channel with that channel's messages.
+ */
+function timelineBody(
+  sessions: Session[],
+  viewMode: ViewMode
+): (Paragraph | Table)[] {
+  const children: (Paragraph | Table)[] = [];
+
+  if (sessions.length === 0) {
+    children.push(
+      new Paragraph({ children: [new TextRun("No messages to display.")] })
+    );
+    return children;
+  }
+
+  if (viewMode === "chronological") {
+    // Merge all session timelines, sort by (time, id)
+    const all = sessions.flatMap((s) => s.timeline);
+    all.sort((a, b) => {
+      const timeCmp = a.time.localeCompare(b.time);
+      return timeCmp !== 0 ? timeCmp : a.id.localeCompare(b.id);
+    });
+    for (const entry of all) {
+      children.push(
+        new Paragraph({
+          children: [
+            new TextRun({ text: `[${entry.channel}] `, bold: true }),
+            new TextRun({ text: `${entry.author} `, bold: true }),
+            new TextRun({ text: `(${entry.time}): `, italics: true }),
+            new TextRun(entry.text),
+          ],
+        })
+      );
+    }
+  } else {
+    // By-channel: group messages under channel headings
+    const byChannel = new Map<string, typeof sessions[0]["timeline"]>();
+    for (const session of sessions) {
+      for (const entry of session.timeline) {
+        const list = byChannel.get(entry.channel) ?? [];
+        list.push(entry);
+        byChannel.set(entry.channel, list);
+      }
+    }
+    for (const [channel, entries] of byChannel) {
+      entries.sort((a, b) => {
+        const timeCmp = a.time.localeCompare(b.time);
+        return timeCmp !== 0 ? timeCmp : a.id.localeCompare(b.id);
+      });
+      children.push(
+        new Paragraph({
+          children: [new TextRun(channel)],
+          heading: HeadingLevel.HEADING_2,
+        })
+      );
+      for (const entry of entries) {
+        children.push(
+          new Paragraph({
+            children: [
+              new TextRun({ text: `${entry.author} `, bold: true }),
+              new TextRun({ text: `(${entry.time}): `, italics: true }),
+              new TextRun(entry.text),
+            ],
+          })
+        );
+      }
+    }
+  }
+
+  return children;
+}
+
+/**
+ * Thread sub-sections: each topic as a distinct block with heading + entries.
+ */
+function threadSubSections(sessions: Session[]): (Paragraph | Table)[] {
+  const children: (Paragraph | Table)[] = [];
+  const allTopics = sessions.flatMap((s) => s.topics);
+
+  if (allTopics.length === 0) {
+    return children;
+  }
+
+  for (const topic of allTopics) {
+    children.push(
+      new Paragraph({
+        children: [new TextRun(`Thread: ${topic.name}`)],
+        heading: HeadingLevel.HEADING_2,
+      })
+    );
+    for (const entry of topic.timeline) {
+      children.push(
+        new Paragraph({
+          children: [
+            new TextRun({ text: `${entry.author} `, bold: true }),
+            new TextRun({ text: `(${entry.time}): `, italics: true }),
+            new TextRun(entry.text),
+          ],
+        })
+      );
+    }
+  }
+
+  return children;
+}
+
+/**
+ * Participant index: unique authors with display names, rendered as a table.
+ */
+function participantIndex(sessions: Session[]): (Paragraph | Table)[] {
+  const children: (Paragraph | Table)[] = [];
+  const seen = new Map<string, string>(); // authorId → displayName
+
+  for (const session of sessions) {
+    for (const entry of session.timeline) {
+      if (!seen.has(entry.authorId)) {
+        seen.set(entry.authorId, entry.author);
+      }
+    }
+  }
+
+  if (seen.size === 0) {
+    return children;
+  }
+
+  const headerRow = new TableRow({
+    children: [
+      new TableCell({
+        children: [new Paragraph({ children: [new TextRun({ text: "Author ID", bold: true })] })],
+        width: { size: 30, type: WidthType.PERCENTAGE },
+      }),
+      new TableCell({
+        children: [new Paragraph({ children: [new TextRun({ text: "Display Name", bold: true })] })],
+        width: { size: 70, type: WidthType.PERCENTAGE },
+      }),
+    ],
+  });
+
+  const rows = [...seen.entries()].map(
+    ([id, name]) =>
+      new TableRow({
+        children: [
+          new TableCell({ children: [new Paragraph(id)] }),
+          new TableCell({ children: [new Paragraph(name)] }),
+        ],
+      })
+  );
+
+  children.push(
+    new Table({
+      rows: [headerRow, ...rows],
+    })
+  );
+
+  return children;
+}
+
+// ---------- buildSections ----------
+
+/**
+ * Build the five document sections from resolved sessions.
+ *
+ * Returns DocxSection[] in order: [titlePage, metadata, timelineBody,
+ * threadSubSections, participantIndex].
+ */
+export function buildSections(
+  sessions: Session[],
+  options: ReportOptions
+): DocxSection[] {
+  const serverName = options.serverName ?? "Session Report";
+
+  // Build filter description for metadata
+  const filterParts: string[] = [];
+  if (options.channelIds.length > 0)
+    filterParts.push(`channels=${options.channelIds.join(",")}`);
+  if (options.from) filterParts.push(`from=${options.from}`);
+  if (options.to) filterParts.push(`to=${options.to}`);
+  if (options.sessionIndex !== null)
+    filterParts.push(`session=${options.sessionIndex}`);
+  const filterDesc = filterParts.join("; ");
+
+  const generatedAt = new Date().toISOString();
+
+  return [
+    { children: titlePage(serverName, sessions) },
+    {
+      children: metadata(
+        generatedAt,
+        options.viewMode,
+        filterDesc,
+        sessions.length
+      ),
+    },
+    { children: timelineBody(sessions, options.viewMode) },
+    { children: threadSubSections(sessions) },
+    { children: participantIndex(sessions) },
+  ];
+}
+
+// ---------- main ----------
+
+/** I/O interface for testability — defaults to fs + process.exit (D3). */
+export interface ReportIO {
+  readFileSync: (path: string, encoding: string) => string;
+  writeFileSync: (path: string, data: Buffer) => void;
+  mkdirSync: (path: string, options: { recursive: boolean }) => void;
+  exit: (code: number) => never;
+}
+
+const defaultIO: ReportIO = {
+  readFileSync: (p, enc) => fs.readFileSync(p, enc),
+  writeFileSync: (p, data) => fs.writeFileSync(p, data),
+  mkdirSync: (p, opts) => fs.mkdirSync(p, opts),
+  exit: (code) => process.exit(code),
+};
+
+/**
+ * CLI entry point. Reads messages.json, validates, filters, renders DOCX.
+ *
+ * - No --session + N sessions → one DOCX per session (D1).
+ * - Zero filter matches → empty DOCX + exit 0 (D2).
+ */
+export async function main(
+  argv: string[],
+  io: ReportIO = defaultIO
+): Promise<void> {
+  const args = parseReportArgs(argv);
+
+  // Read and parse input
+  let jsonString: string;
+  try {
+    jsonString = io.readFileSync(args.inputPath, "utf-8");
+  } catch {
+    console.error(`error: could not read ${args.inputPath}`);
+    io.exit(1);
+    return; // unreachable but satisfies TS
+  }
+
+  let output: ExportOutput;
+  try {
+    output = loadAndValidate(jsonString);
+  } catch (err: any) {
+    console.error(`error: ${err.message}`);
+    io.exit(1);
+    return;
+  }
+
+  // Filter and resolve
+  const sessions = filterSessions(output, args);
+  const resolved = sessions.map((s) =>
+    resolveNames(s, output.users, output.channels)
+  );
+
+  // Build sections
+  const sections = buildSections(resolved, args);
+
+  // Create document
+  const doc = new Document({ sections });
+  const buffer = await Packer.toBuffer(doc);
+
+  // Write output
+  if (args.output) {
+    // Single output path
+    io.mkdirSync(path.dirname(args.output), { recursive: true });
+    io.writeFileSync(args.output, buffer);
+  } else {
+    // One DOCX per session
+    for (const session of resolved) {
+      const outPath = computeOutputPath(args, session, output.guildId);
+      io.mkdirSync(path.dirname(outPath), { recursive: true });
+      io.writeFileSync(outPath, buffer);
+    }
+  }
+
+  io.exit(0);
 }
