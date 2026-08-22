@@ -16,9 +16,10 @@ import {
   Table,
   TableRow,
   TableCell,
+  TableLayoutType,
   WidthType,
   AlignmentType,
-  type SectionProperties,
+  type ISectionPropertiesOptions,
 } from "docx";
 import { ExportOutput, Session } from "./exportMessages";
 
@@ -46,7 +47,7 @@ export interface ParsedReportArgs extends ReportOptions {
 /** A logical document section — children are docx element instances. */
 export interface DocxSection {
   children: (Paragraph | Table)[];
-  properties?: SectionProperties;
+  properties?: ISectionPropertiesOptions;
 }
 
 // ---------- constants ----------
@@ -525,15 +526,21 @@ function participantIndex(sessions: Session[]): (Paragraph | Table)[] {
     return children;
   }
 
+  // Column widths must be set on EVERY cell (not just the header) and the
+  // table must declare an explicit total width + fixed layout; otherwise
+  // Word/Google Docs collapse the table to the narrowest cell.
+  const idWidth = { size: 30, type: WidthType.PERCENTAGE };
+  const nameWidth = { size: 70, type: WidthType.PERCENTAGE };
+
   const headerRow = new TableRow({
     children: [
       new TableCell({
         children: [new Paragraph({ children: [new TextRun({ text: "Author ID", bold: true })] })],
-        width: { size: 30, type: WidthType.PERCENTAGE },
+        width: idWidth,
       }),
       new TableCell({
         children: [new Paragraph({ children: [new TextRun({ text: "Display Name", bold: true })] })],
-        width: { size: 70, type: WidthType.PERCENTAGE },
+        width: nameWidth,
       }),
     ],
   });
@@ -542,14 +549,16 @@ function participantIndex(sessions: Session[]): (Paragraph | Table)[] {
     ([id, name]) =>
       new TableRow({
         children: [
-          new TableCell({ children: [new Paragraph(id)] }),
-          new TableCell({ children: [new Paragraph(name)] }),
+          new TableCell({ children: [new Paragraph(id)], width: idWidth }),
+          new TableCell({ children: [new Paragraph(name)], width: nameWidth }),
         ],
       })
   );
 
   children.push(
     new Table({
+      width: { size: 100, type: WidthType.PERCENTAGE },
+      layout: TableLayoutType.FIXED,
       rows: [headerRow, ...rows],
     })
   );
@@ -606,11 +615,11 @@ export interface ReportIO {
   readFileSync: (path: string, encoding: string) => string;
   writeFileSync: (path: string, data: Buffer) => void;
   mkdirSync: (path: string, options: { recursive: boolean }) => void;
-  exit: (code: number) => never;
+  exit: (code: number) => void;
 }
 
 const defaultIO: ReportIO = {
-  readFileSync: (p, enc) => fs.readFileSync(p, enc),
+  readFileSync: (p, enc) => fs.readFileSync(p, enc as BufferEncoding),
   writeFileSync: (p, data) => fs.writeFileSync(p, data),
   mkdirSync: (p, opts) => fs.mkdirSync(p, opts),
   exit: (code) => process.exit(code),
@@ -653,21 +662,20 @@ export async function main(
     resolveNames(s, output.users, output.channels)
   );
 
-  // Build sections
-  const sections = buildSections(resolved, args);
-
-  // Create document
-  const doc = new Document({ sections });
-  const buffer = await Packer.toBuffer(doc);
-
-  // Write output
+  // Build and write output.
   if (args.output) {
-    // Single output path
+    // Single explicit --output path: one document containing all filtered sessions.
+    const sections = buildSections(resolved, args);
+    const doc = new Document({ sections });
+    const buffer = await Packer.toBuffer(doc);
     io.mkdirSync(path.dirname(args.output), { recursive: true });
     io.writeFileSync(args.output, buffer);
   } else {
-    // One DOCX per session
+    // No --output: one DOCX per session, each containing ONLY that session (D1).
     for (const session of resolved) {
+      const sections = buildSections([session], args);
+      const doc = new Document({ sections });
+      const buffer = await Packer.toBuffer(doc);
       const outPath = computeOutputPath(args, session, output.guildId);
       io.mkdirSync(path.dirname(outPath), { recursive: true });
       io.writeFileSync(outPath, buffer);
@@ -675,4 +683,19 @@ export async function main(
   }
 
   io.exit(0);
+}
+
+// run only when this file is the entry point, so tests can import pure
+// functions without triggering a report. realpathSync handles symlinks.
+if (process.argv[1]) {
+  try {
+    if (fs.realpathSync(process.argv[1]) === fs.realpathSync(__filename)) {
+      main(process.argv.slice(2)).catch((err: any) => {
+        console.error(`report failed: ${err?.message ?? err}`);
+        process.exitCode = 1;
+      });
+    }
+  } catch {
+    // process.argv[1] does not resolve: not a valid invocation of this file
+  }
 }

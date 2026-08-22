@@ -10,6 +10,7 @@ import {
   buildSections,
   main,
   type ExportOutput,
+  type ReportIO,
   type ReportOptions,
 } from "./generateReport";
 
@@ -505,23 +506,22 @@ describe("buildSections", () => {
 describe("main", () => {
   it("writes DOCX to --output path for single session", async () => {
     const output = makeOutput();
-    let writtenPath = "";
-    let writtenBuffer: Buffer | null = null;
+    const captured: { path: string; buffer: Buffer | null } = { path: "", buffer: null };
 
-    const io = {
+    const io: ReportIO = {
       readFileSync: (_p: string, _enc: string) => JSON.stringify(output),
       writeFileSync: (p: string, data: Buffer) => {
-        writtenPath = p;
-        writtenBuffer = data;
+        captured.path = p;
+        captured.buffer = data;
       },
       mkdirSync: (_p: string, _opts: any) => {},
       exit: (code: number) => { if (code !== 0) throw new Error(`exit(${code})`); },
     };
 
     await main(["--output", "/tmp/test-report.docx"], io);
-    assert.equal(writtenPath, "/tmp/test-report.docx");
-    assert.ok(writtenBuffer, "buffer must be written");
-    assert.ok(writtenBuffer!.length > 0, "DOCX must not be empty");
+    assert.equal(captured.path, "/tmp/test-report.docx");
+    assert.ok(captured.buffer, "buffer must be written");
+    assert.ok(captured.buffer!.length > 0, "DOCX must not be empty");
   });
 
   it("writes one DOCX per session when no --session flag", async () => {
@@ -532,26 +532,34 @@ describe("main", () => {
       ],
     });
     const writtenPaths: string[] = [];
+    const writtenBuffers: Buffer[] = [];
 
-    const io = {
+    const io: ReportIO = {
       readFileSync: (_p: string, _enc: string) => JSON.stringify(output),
-      writeFileSync: (p: string, _data: Buffer) => { writtenPaths.push(p); },
+      writeFileSync: (p: string, data: Buffer) => { writtenPaths.push(p); writtenBuffers.push(data); },
       mkdirSync: (_p: string, _opts: any) => {},
       exit: (code: number) => { if (code !== 0) throw new Error(`exit(${code})`); },
     };
 
     await main(["--server-name", "TestServer"], io);
     assert.equal(writtenPaths.length, 2, "must write one file per session");
+    assert.equal(writtenBuffers.length, 2, "must produce one buffer per session");
     // Each path should contain the session slug
     assert.ok(writtenPaths[0].includes("session-"), "first file must be a session docx");
     assert.ok(writtenPaths[1].includes("session-"), "second file must be a session docx");
+    // Each DOCX must contain only its own session — the two buffers must differ.
+    assert.notEqual(
+      writtenBuffers[0].toString("hex"),
+      writtenBuffers[1].toString("hex"),
+      "each session DOCX must render only that session (buffers must differ)"
+    );
   });
 
   it("writes empty DOCX and exits 0 when zero sessions match", async () => {
     const output = makeOutput();
     let exitCalled = false;
 
-    const io = {
+    const io: ReportIO = {
       readFileSync: (_p: string, _enc: string) => JSON.stringify(output),
       writeFileSync: (_p: string, _data: Buffer) => {},
       mkdirSync: (_p: string, _opts: any) => {},
@@ -568,7 +576,7 @@ describe("main", () => {
   it("exits non-zero when input file is missing", async () => {
     let exitCode: number | null = null;
 
-    const io = {
+    const io: ReportIO = {
       readFileSync: (_p: string, _enc: string) => { throw new Error("ENOENT"); },
       writeFileSync: (_p: string, _data: Buffer) => {},
       mkdirSync: (_p: string, _opts: any) => {},
@@ -582,7 +590,7 @@ describe("main", () => {
   it("exits non-zero on invalid JSON", async () => {
     let exitCode: number | null = null;
 
-    const io = {
+    const io: ReportIO = {
       readFileSync: (_p: string, _enc: string) => "{bad json",
       writeFileSync: (_p: string, _data: Buffer) => {},
       mkdirSync: (_p: string, _opts: any) => {},
@@ -597,7 +605,7 @@ describe("main", () => {
     let exitCode: number | null = null;
     const badOutput = makeOutput({ schemaVersion: "99" });
 
-    const io = {
+    const io: ReportIO = {
       readFileSync: (_p: string, _enc: string) => JSON.stringify(badOutput),
       writeFileSync: (_p: string, _data: Buffer) => {},
       mkdirSync: (_p: string, _opts: any) => {},
