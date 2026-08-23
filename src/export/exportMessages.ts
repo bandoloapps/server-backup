@@ -56,6 +56,7 @@ export interface ExportInput {
     messages: DecryptedMessageRecord[];
     users: UserRecord[];
     channels: ChannelRecord[];
+    attachmentIds?: Set<string>;
 }
 
 export interface ExportOptions {
@@ -80,6 +81,14 @@ export interface ParsedArgs {
     outDir: string;
 }
 
+export type SchemaVersion = "1" | "2";
+
+export interface ExportImageRef {
+    name: string;
+    path: string;
+    contentType: string | null;
+}
+
 export interface OutputEntry {
     id: string;
     channelId: string;
@@ -88,6 +97,7 @@ export interface OutputEntry {
     channel: string;
     time: string;
     text: string;
+    images?: ExportImageRef[];
 }
 
 export interface Topic {
@@ -106,7 +116,7 @@ export interface Session {
 }
 
 export interface ExportOutput {
-    schemaVersion: string;
+    schemaVersion: SchemaVersion | string;
     guildId: string | null;
     generatedAt: string;
     mode: "full" | "incremental";
@@ -184,6 +194,108 @@ export const decryptText = (blob: Buffer | null | undefined, password?: string):
     }
 };
 
+// ---------- raw buffer decryption for images (same cipher as decryptText, no UTF-8) ----------
+
+export const decryptData = (blob: Buffer | null | undefined, password?: string): Buffer => {
+    if (blob == null || blob.length === 0) return Buffer.alloc(0);
+    if (!password) return blob;
+    const key = getKey(password);
+    const decipher = crypto.createDecipheriv("aes256", key, Buffer.alloc(16, 0));
+    try {
+        return Buffer.concat([decipher.update(blob), decipher.final()]);
+    } catch (err: any) {
+        throw new Error(`decryption failed: wrong or missing password (${err.code ?? err.message})`);
+    }
+};
+
+// ---------- image helpers (ext, magic, sanitize, atomic write, contentType) ----------
+
+const ALLOWED_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
+
+export const isAllowedExt = (name: string): boolean => {
+    const dot = name.lastIndexOf(".");
+    if (dot < 0 || dot === name.length - 1) return false;
+    const ext = name.slice(dot + 1).toLowerCase();
+    return ALLOWED_EXTS.has(ext);
+};
+
+export const sniffMagic = (buf: Buffer, ext: string): boolean => {
+    if (!buf || buf.length < 2) return false;
+    const e = ext.replace(/^\./, "").toLowerCase();
+    if (e === "png") {
+        return buf.length >= 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+    }
+    if (e === "jpg" || e === "jpeg") {
+        return buf[0] === 0xff && buf[1] === 0xd8;
+    }
+    if (e === "gif") {
+        return buf.length >= 3 && buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46;
+    }
+    if (e === "webp") {
+        if (buf.length < 12) return false;
+        return buf.subarray(0, 4).toString() === "RIFF" && buf.subarray(8, 12).toString() === "WEBP";
+    }
+    return false;
+};
+
+export const inferImageExt = (buf: Buffer): string | null => {
+    if (!buf || buf.length < 2) return null;
+    if (buf.length >= 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "png";
+    if (buf[0] === 0xff && buf[1] === 0xd8) return "jpg";
+    if (buf.length >= 3 && buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return "gif";
+    if (buf.length >= 12 && buf.subarray(0, 4).toString() === "RIFF" && buf.subarray(8, 12).toString() === "WEBP") return "webp";
+    return null;
+};
+
+export const sanitizeName = (name: string): string => name.replace(/[^a-zA-Z0-9._-]/g, "_");
+
+/** Truncate `${messageId}__${sanitized}` to `maxBase` (default 200) preserving ext and prefix + hash for uniqueness. */
+export const truncateFileName = (messageId: string, sanitized: string, maxBase = 200): string => {
+    const prefix = `${messageId}__`;
+    const fileName = `${prefix}${sanitized}`;
+    if (fileName.length <= maxBase) return fileName;
+    const dot = sanitized.lastIndexOf(".");
+    const extWithDot = dot >= 0 && dot < sanitized.length - 1 ? sanitized.slice(dot) : "";
+    const stem = extWithDot ? sanitized.slice(0, -extWithDot.length) : sanitized;
+    const maxStem = maxBase - prefix.length - extWithDot.length;
+    if (maxStem <= 0) return `${prefix.slice(0, maxBase - extWithDot.length)}${extWithDot}`.slice(0, maxBase);
+    if (stem.length <= maxStem) return `${prefix}${stem}${extWithDot}`;
+    const hash = crypto.createHash("sha256").update(sanitized).digest("hex").slice(0, 8);
+    if (maxStem <= hash.length + 1) {
+        return `${prefix}${stem.slice(0, maxStem)}${extWithDot}`;
+    }
+    const keep = maxStem - hash.length - 1; // 1 for '-'
+    return `${prefix}${stem.slice(0, keep)}-${hash}${extWithDot}`;
+};
+
+const extToContentType = (ext: string): string | null => {
+    const e = ext.replace(/^\./, "").toLowerCase();
+    if (e === "png") return "image/png";
+    if (e === "jpg" || e === "jpeg") return "image/jpeg";
+    if (e === "gif") return "image/gif";
+    if (e === "webp") return "image/webp";
+    return null;
+};
+
+export const writeImageAtomic = (dst: string, data: Buffer): void => {
+    const dir = path.dirname(dst);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(dir, 0o700); } catch {}
+    const basename = path.basename(dst);
+    const hash = crypto.createHash("sha256").update(basename).digest("hex").slice(0, 12);
+    const tmp = path.join(dir, `.tmp-${hash}-${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2, 6)}`);
+    const fd = fs.openSync(tmp, "w", 0o600);
+    try {
+        fs.writeSync(fd, data);
+        fs.fsyncSync(fd);
+    } finally {
+        fs.closeSync(fd);
+    }
+    try { fs.chmodSync(tmp, 0o600); } catch {}
+    fs.renameSync(tmp, dst);
+    try { fs.chmodSync(dst, 0o600); } catch {}
+};
+
 // ---------- name resolution (spec: unknown (<id>) fallback, never crash) ----------
 
 export const resolveName = (id: string, names: Map<string, string>): string =>
@@ -225,6 +337,7 @@ interface InternalEntry {
     channel: string;
     time: number;
     text: string;
+    images?: ExportImageRef[];
 }
 
 interface InternalTopic {
@@ -244,15 +357,19 @@ interface InternalSession {
     topics: InternalTopic[];
 }
 
-const toOutputEntry = (e: InternalEntry): OutputEntry => ({
-    id: e.id,
-    channelId: e.channelId,
-    authorId: e.authorId,
-    author: e.author,
-    channel: e.channel,
-    time: new Date(e.time).toISOString(), // ISO-8601 UTC — never SQL strftime
-    text: e.text,
-});
+const toOutputEntry = (e: InternalEntry): OutputEntry => {
+    const out: OutputEntry = {
+        id: e.id,
+        channelId: e.channelId,
+        authorId: e.authorId,
+        author: e.author,
+        channel: e.channel,
+        time: new Date(e.time).toISOString(), // ISO-8601 UTC — never SQL strftime
+        text: e.text,
+    };
+    if (e.images && e.images.length > 0) out.images = e.images;
+    return out;
+};
 
 export const buildExport = (input: ExportInput, options: ExportOptions): ExportResult => {
     const { userNames, channelNames, threadIds } = buildNameMap(input.users, input.channels);
@@ -261,10 +378,11 @@ export const buildExport = (input: ExportInput, options: ExportOptions): ExportR
     const fromMs = options.from != null ? parseIso(options.from, "--from") : null;
     const toMs = options.to != null ? parseIso(options.to, "--to") : null;
 
-    // filter + empty-text skip + name resolution (B1.4, B1.5)
+    // filter + empty-text skip except image-only (fix-docx-image-pipeline Bug2)
+    const attachmentIds = input.attachmentIds ?? new Set<string>();
     const entries: InternalEntry[] = [];
     for (const m of input.messages) {
-        if (m.text.trim().length === 0) continue; // empty/whitespace-only skipped
+        if (m.text.trim().length === 0 && !attachmentIds.has(m.messageId)) continue; // empty/whitespace-only skipped unless image-only
         if (channelFilter.size > 0 && !channelFilter.has(m.channelId)) continue;
         if (fromMs != null && m.time < fromMs) continue;
         if (toMs != null && m.time > toMs) continue;
@@ -391,8 +509,9 @@ export const buildExport = (input: ExportInput, options: ExportOptions): ExportR
         if (maxTime == null || e.time > maxTime) maxTime = e.time;
     }
 
+    const hasImages = unique.some((e) => e.images && e.images.length > 0);
     const output: ExportOutput = {
-        schemaVersion: "1",
+        schemaVersion: (hasImages ? "2" : "1") as SchemaVersion,
         guildId: options.guildId,
         generatedAt: new Date().toISOString(),
         mode: options.incremental ? "incremental" : "full",
@@ -450,6 +569,12 @@ export const readWatermark = (outDir: string): number | null => {
 
 // ---------- offline DB read (B1.1, D5) ----------
 
+export interface AttachmentRecord {
+    messageId: string;
+    name: string;
+    data: Buffer | null;
+}
+
 const defineExportModels = (sequelize: Sequelize) => {
     const messages = sequelize.define("messages", {
         channelId: { type: STRING },
@@ -470,7 +595,13 @@ const defineExportModels = (sequelize: Sequelize) => {
         type: { type: STRING },
         parentId: { type: STRING },
     }, { timestamps: false, freezeTableName: true });
-    return { messages, users, channels };
+    // Inline attachments model — offline boundary, no import from models/attachments.ts
+    const attachments = sequelize.define("attachments", {
+        messageId: { type: STRING },
+        name: { type: STRING },
+        data: { type: BLOB },
+    }, { timestamps: false, freezeTableName: true });
+    return { messages, users, channels, attachments };
 };
 
 // no sequelize.sync(): a missing table means "empty cache", never "create it".
@@ -492,10 +623,11 @@ const safeFindAll = async (model: any): Promise<any[]> => {
 
 const loadRecords = async (sequelize: Sequelize) => {
     const models = defineExportModels(sequelize);
-    const [messages, users, channels] = await Promise.all([
+    const [messages, users, channels, attachments] = await Promise.all([
         safeFindAll(models.messages),
         safeFindAll(models.users),
         safeFindAll(models.channels),
+        safeFindAll((models as any).attachments),
     ]);
     return {
         messages: messages.map((m: any) => ({
@@ -517,7 +649,89 @@ const loadRecords = async (sequelize: Sequelize) => {
             type: c.type as string | null,
             parentId: c.parentId as string | null,
         })),
+        attachments: attachments.map((a: any) => ({
+            messageId: a.messageId as string,
+            name: a.name as string,
+            data: a.data as Buffer | null,
+        })) as AttachmentRecord[],
     };
+};
+
+// ---------- image materialization (decrypt → filter → atomic write) ----------
+
+export const decryptAndMaterializeImages = (
+    attachments: AttachmentRecord[],
+    password: string | undefined,
+    outDir: string,
+    emittedIds: Set<string>
+): Map<string, ExportImageRef[]> => {
+    const pending: Array<{ dst: string; data: Buffer; ref: ExportImageRef; messageId: string }> = [];
+    const errors: string[] = [];
+    const map = new Map<string, ExportImageRef[]>();
+
+    for (const att of attachments) {
+        if (!att.messageId || !att.name) continue;
+        if (!emittedIds.has(att.messageId)) continue;
+        let raw: Buffer;
+        try {
+            if (att.data == null) continue;
+            raw = decryptData(att.data, password);
+            if (raw.length === 0) continue;
+        } catch (err: any) {
+            errors.push(`attachment ${att.messageId}/${att.name}: ${err.message}`);
+            continue;
+        }
+        if (errors.length > 0) continue;
+        const dot = att.name.lastIndexOf(".");
+        const declaredExt = dot >= 0 && dot < att.name.length - 1 ? att.name.slice(dot + 1) : "";
+        let effectiveExt = declaredExt;
+        let needsRescue = !isAllowedExt(att.name) || !sniffMagic(raw, declaredExt);
+        if (needsRescue) {
+            const inferred = inferImageExt(raw);
+            if (!inferred || !sniffMagic(raw, inferred)) continue;
+            effectiveExt = inferred;
+        } else {
+            // allowed and magic matches — keep declared ext as-is
+            effectiveExt = declaredExt;
+            if (!sniffMagic(raw, effectiveExt)) continue;
+        }
+        // sanitize then rewrite ext to effectiveExt, then truncate
+        const sanitizedRaw = sanitizeName(att.name);
+        let sanitized: string;
+        if (effectiveExt !== declaredExt) {
+            const sDot = sanitizedRaw.lastIndexOf(".");
+            if (sDot >= 0 && sDot < sanitizedRaw.length - 1) {
+                sanitized = sanitizedRaw.slice(0, sDot + 1) + effectiveExt;
+            } else if (sDot === sanitizedRaw.length - 1) {
+                sanitized = sanitizedRaw + effectiveExt;
+            } else {
+                sanitized = `${sanitizedRaw}.${effectiveExt}`;
+            }
+        } else {
+            sanitized = sanitizedRaw;
+        }
+        const fileName = truncateFileName(att.messageId, sanitized, 200);
+        const relPath = `images/${fileName}`;
+        const dst = path.join(outDir, relPath);
+        const contentType = extToContentType(effectiveExt);
+        const ref: ExportImageRef = { name: att.name, path: relPath, contentType };
+        pending.push({ dst, data: raw, ref, messageId: att.messageId });
+    }
+
+    if (errors.length > 0) {
+        throw new Error(
+            `decryption failed for ${errors.length} attachment(s) — fix the password and re-run:\n${errors.slice(0, 5).join("\n")}`
+        );
+    }
+
+    // atomic writes only after all decrypts succeeded (fail-loud, no partial images)
+    for (const p of pending) {
+        writeImageAtomic(p.dst, p.data);
+        const arr = map.get(p.messageId) ?? [];
+        arr.push(p.ref);
+        map.set(p.messageId, arr);
+    }
+    return map;
 };
 
 // ---------- orchestration (B1.2 entry: dist/export/exportMessages.js) ----------
@@ -535,7 +749,7 @@ export const runExport = async (
         );
     }
 
-    const { messages, users, channels } = await loadRecords(sequelize);
+    const { messages, users, channels, attachments } = await loadRecords(sequelize);
 
     // decrypt first — a single wrong/missing key aborts the whole export and
     // writes NOTHING (security spec: no ciphertext emitted as text)
@@ -554,7 +768,8 @@ export const runExport = async (
         );
     }
 
-    const result = buildExport({ messages: decrypted, users, channels }, options);
+    const attachmentIds = new Set(attachments.map(a => a.messageId));
+    const result = buildExport({ messages: decrypted, users, channels, attachmentIds }, options);
 
     // A filtered export must NEVER touch the watermark sidecar: its maxTime is
     // only a subset, and writing it would cause later unfiltered --incremental
@@ -573,7 +788,43 @@ export const runExport = async (
         );
     }
 
+    // Materialize images only for emitted messages (filter respects channel/from/to/watermark)
+    const emittedIds = new Set<string>();
+    for (const s of result.output.sessions) {
+        for (const e of s.timeline) emittedIds.add(e.id);
+        for (const t of s.topics) for (const e of t.timeline) emittedIds.add(e.id);
+    }
+
+    // decrypt + filter + atomic write to <outDir>/images/<id>__<sanitized>
+    // fail-loud: single attachment decrypt failure aborts with no partial messages.json/images
+    let imageMap: Map<string, ExportImageRef[]> = new Map();
+    if (emittedIds.size > 0 && attachments.length > 0) {
+        imageMap = decryptAndMaterializeImages(attachments, options.password, outDir, emittedIds);
+        // inject into output sessions (timeline + topics)
+        let hasAny = false;
+        for (const s of result.output.sessions) {
+            for (const e of s.timeline) {
+                const imgs = imageMap.get(e.id);
+                if (imgs && imgs.length > 0) {
+                    (e as OutputEntry).images = imgs;
+                    hasAny = true;
+                }
+            }
+            for (const t of s.topics) for (const e of t.timeline) {
+                const imgs = imageMap.get(e.id);
+                if (imgs && imgs.length > 0) {
+                    (e as OutputEntry).images = imgs;
+                    hasAny = true;
+                }
+            }
+        }
+        if (hasAny) result.output.schemaVersion = "2" as SchemaVersion;
+        // if no images survived filtering, keep "1" (buildExport already set it)
+    }
+
+    // atomic writes — messages.json second, only after images succeeded
     fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(outDir, 0o700); } catch {}
     const messagesPath = path.join(outDir, "messages.json");
     const watermarkPath = path.join(outDir, "watermark.json");
     writeFileAtomic(messagesPath, JSON.stringify(result.output, null, 2) + "\n");

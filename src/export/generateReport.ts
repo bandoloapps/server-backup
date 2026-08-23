@@ -12,6 +12,7 @@ import {
   Packer,
   Paragraph,
   TextRun,
+  ImageRun,
   HeadingLevel,
   Table,
   TableRow,
@@ -19,12 +20,30 @@ import {
   TableLayoutType,
   WidthType,
   AlignmentType,
+  SectionType,
   type ISectionPropertiesOptions,
 } from "docx";
 import { ExportOutput, Session } from "./exportMessages";
+import imageSizeImport from "image-size";
 
 // Re-export for consumers
 export type { ExportOutput, Session } from "./exportMessages";
+
+// ---------- image dimensions wrapper (image-size@^1.1.1, CJS) ----------
+
+const imageSizeFn: (buf: Buffer) => { width?: number; height?: number; type?: string } =
+  (imageSizeImport as unknown as { default?: typeof imageSizeImport }).default ?? (imageSizeImport as unknown as typeof imageSizeImport);
+
+/** Return {width,height} for PNG/JPEG/GIF/WebP buffers, or null on corrupt/truncated. */
+export const getImageDimensions = (buf: Buffer): { width: number; height: number } | null => {
+  try {
+    const s = imageSizeFn(buf);
+    if (s.width == null || s.height == null || s.width <= 0 || s.height <= 0) return null;
+    return { width: s.width, height: s.height };
+  } catch {
+    return null;
+  }
+};
 
 // ---------- types ----------
 
@@ -52,7 +71,190 @@ export interface DocxSection {
 
 // ---------- constants ----------
 
-const SUPPORTED_SCHEMA_VERSIONS = new Set(["1"]);
+export const SUPPORTED_SCHEMA_VERSIONS = new Set(["1", "2"]);
+
+export const MAX_BYTES = 5 * 1024 * 1024;
+
+export const resolveImagePath = (inputPath: string, rel: string): string =>
+  path.join(path.dirname(inputPath), rel);
+
+export const mimeToDocxType = (ext: string): "png" | "jpg" | "gif" => {
+  const e = ext.replace(/^\./, "").toLowerCase();
+  if (e === "png") return "png";
+  if (e === "jpg" || e === "jpeg") return "jpg";
+  if (e === "gif") return "gif";
+  if (e === "webp") return "png";
+  return "png";
+};
+
+export const clampTransform = (
+  naturalWidth?: number,
+  naturalHeight?: number
+): { width: number; height: number } => {
+  const MAX_W = 450;
+  const MAX_H = 300;
+  if (
+    naturalWidth == null ||
+    naturalHeight == null ||
+    naturalWidth <= 0 ||
+    naturalHeight <= 0
+  ) {
+    return { width: MAX_W, height: MAX_H };
+  }
+  let w = Math.min(naturalWidth, MAX_W);
+  let h = Math.round((w * naturalHeight) / naturalWidth);
+  if (h > MAX_H) {
+    h = MAX_H;
+    w = Math.round((h * naturalWidth) / naturalHeight);
+  }
+  return { width: w, height: h };
+};
+
+const isKnownImageMagic = (buf: Buffer): boolean => {
+  if (!buf || buf.length < 2) return false;
+  if (buf.length >= 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return true;
+  if (buf[0] === 0xff && buf[1] === 0xd8) return true;
+  if (buf.length >= 3 && buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return true;
+  if (buf.length >= 12 && buf.subarray(0, 4).toString() === "RIFF" && buf.subarray(8, 12).toString() === "WEBP") return true;
+  return false;
+};
+
+export const tryEmbedImages = (
+  entry: Session["timeline"][number],
+  baseDir: string
+): Paragraph[] => {
+  const images = (entry as unknown as { images?: Array<{ name: string; path: string; contentType: string | null }> }).images;
+  if (!images || images.length === 0) return [];
+  const effectiveBase = baseDir || ".";
+  const out: Paragraph[] = [];
+  for (const img of images) {
+    const fullPath = path.join(effectiveBase, img.path);
+    try {
+      const stat = fs.statSync(fullPath);
+      if (stat.size > MAX_BYTES) throw new Error("oversized");
+      const data = fs.readFileSync(fullPath);
+      if (data.length === 0) throw new Error("empty");
+      if (!isKnownImageMagic(data)) throw new Error("corrupt or unsupported");
+      const ext = path.extname(img.name).replace(/^\./, "").toLowerCase();
+      const type = mimeToDocxType(ext);
+      const dims = getImageDimensions(data);
+      const { width, height } = dims ? clampTransform(dims.width, dims.height) : clampTransform();
+      const run = new ImageRun({
+        data,
+        transformation: { width, height },
+        type: type as any,
+      } as any);
+      out.push(new Paragraph({ children: [run] }));
+    } catch {
+      out.push(
+        new Paragraph({
+          children: [
+            new TextRun({
+              text: `[image: ${img.name} unavailable]`,
+              italics: true,
+            }),
+          ],
+        })
+      );
+    }
+  }
+  return out;
+};
+
+export const TZ = "America/Sao_Paulo" as const;
+
+const SPAN_OPTS: Intl.DateTimeFormatOptions = {
+  timeZone: TZ,
+  day: "numeric",
+  month: "long",
+  year: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+};
+
+const MSG_OPTS: Intl.DateTimeFormatOptions = {
+  timeZone: TZ,
+  day: "2-digit",
+  month: "2-digit",
+  year: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+};
+
+const FOOTER_OPTS: Intl.DateTimeFormatOptions = {
+  timeZone: TZ,
+  day: "2-digit",
+  month: "short",
+  year: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+};
+
+export function formatSpan(s: string, e: string): string {
+  const d1 = new Date(s);
+  if (Number.isNaN(d1.getTime())) throw new Error(`invalid date: ${s}`);
+  const d2 = new Date(e);
+  if (Number.isNaN(d2.getTime())) throw new Error(`invalid date: ${e}`);
+  const fmt = new Intl.DateTimeFormat("pt-BR", SPAN_OPTS);
+  const a = fmt.format(d1).replace(" às ", ", ");
+  const b = fmt.format(d2).replace(" às ", ", ");
+  return `${a} — ${b}`;
+}
+
+export function formatMessageTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) throw new Error(`invalid date: ${iso}`);
+  const fmt = new Intl.DateTimeFormat("pt-BR", MSG_OPTS);
+  return fmt.format(d).replace(", ", " ");
+}
+
+export function formatFooterTime(d: Date): string {
+  if (Number.isNaN(d.getTime())) throw new Error(`invalid date: ${String(d)}`);
+  const fmt = new Intl.DateTimeFormat("pt-BR", FOOTER_OPTS);
+  const base = fmt.format(d).replace(/ de /g, " ");
+  return `${base} -03:00`;
+}
+
+export function formatDay(isoTime: string, timeZone: string): string {
+  const d = new Date(isoTime);
+  if (Number.isNaN(d.getTime())) throw new Error(`invalid date: ${isoTime}`);
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  return fmt.format(d);
+}
+
+export function groupSessionsByDay(
+  sessions: Session[],
+  timeZone: string
+): Map<string, Session[]> {
+  const map = new Map<string, Session[]>();
+  for (const s of sessions) {
+    const rawIso =
+      s.start && s.start.trim() !== "" ? s.start : (s.timeline[0]?.time ?? "");
+    if (!rawIso) continue;
+    const day = formatDay(rawIso, timeZone);
+    const arr = map.get(day) ?? [];
+    arr.push(s);
+    map.set(day, arr);
+  }
+  return map;
+}
+
+export function computeDailyOutputPath(
+  serverName: string | null,
+  day: string,
+  guildId?: string | null
+): string {
+  const raw = serverName ?? guildId ?? "unknown";
+  const sanitized = raw.replace(/[^a-zA-Z0-9-_]/g, "_");
+  return path.join("exports", sanitized, `daily-${day}.docx`);
+}
 
 // ---------- pure functions ----------
 
@@ -321,6 +523,7 @@ function formatSlug(isoTime: string): string {
 
 /**
  * Title page: server name + session span (first → last message time).
+ * Title 48 Aptos Display bold CENTER, span Aptos 24 CENTER after 480.
  */
 function titlePage(
   serverName: string,
@@ -330,7 +533,14 @@ function titlePage(
 
   children.push(
     new Paragraph({
-      children: [new TextRun({ text: serverName, bold: true, size: 48 })],
+      children: [
+        new TextRun({
+          text: serverName,
+          bold: true,
+          size: 48,
+          font: "Aptos Display",
+        }),
+      ],
       heading: HeadingLevel.TITLE,
       alignment: AlignmentType.CENTER,
     })
@@ -339,21 +549,33 @@ function titlePage(
   if (sessions.length > 0) {
     const first = sessions[0].start;
     const last = sessions[sessions.length - 1].end;
-    const spanText =
-      sessions.length === 1
-        ? `${first} — ${last}`
-        : `${sessions.length} sessions: ${first} — ${last}`;
+    let spanText: string;
+    if (sessions.length === 1) {
+      try {
+        spanText = formatSpan(first, last);
+      } catch {
+        spanText = `${first} — ${last}`;
+      }
+    } else {
+      try {
+        spanText = `${sessions.length} sessions: ${formatSpan(first, last)}`;
+      } catch {
+        spanText = `${sessions.length} sessions: ${first} — ${last}`;
+      }
+    }
     children.push(
       new Paragraph({
-        children: [new TextRun({ text: spanText, size: 24 })],
+        children: [new TextRun({ text: spanText, size: 24, font: "Aptos" })],
         alignment: AlignmentType.CENTER,
+        spacing: { after: 480 },
       })
     );
   } else {
     children.push(
       new Paragraph({
-        children: [new TextRun({ text: "No sessions", size: 24 })],
+        children: [new TextRun({ text: "No sessions", size: 24, font: "Aptos" })],
         alignment: AlignmentType.CENTER,
+        spacing: { after: 480 },
       })
     );
   }
@@ -363,6 +585,7 @@ function titlePage(
 
 /**
  * Metadata: generated-at, view mode, filter description, session count.
+ * 4× RIGHT Aptos 18, last after 360, footer -03:00 handled by formatFooterTime.
  */
 function metadata(
   generatedAt: string,
@@ -373,29 +596,106 @@ function metadata(
   return [
     new Paragraph({
       children: [
-        new TextRun({ text: "Generated: ", bold: true }),
-        new TextRun(generatedAt),
+        new TextRun({ text: "Generated: ", bold: true, font: "Aptos", size: 18 }),
+        new TextRun({ text: generatedAt, font: "Aptos", size: 18 }),
       ],
+      alignment: AlignmentType.RIGHT,
     }),
     new Paragraph({
       children: [
-        new TextRun({ text: "View: ", bold: true }),
-        new TextRun(viewMode),
+        new TextRun({ text: "View: ", bold: true, font: "Aptos", size: 18 }),
+        new TextRun({ text: viewMode, font: "Aptos", size: 18 }),
       ],
+      alignment: AlignmentType.RIGHT,
     }),
     new Paragraph({
       children: [
-        new TextRun({ text: "Filter: ", bold: true }),
-        new TextRun(filterDesc || "none"),
+        new TextRun({ text: "Filter: ", bold: true, font: "Aptos", size: 18 }),
+        new TextRun({ text: filterDesc || "none", font: "Aptos", size: 18 }),
       ],
+      alignment: AlignmentType.RIGHT,
     }),
     new Paragraph({
       children: [
-        new TextRun({ text: "Sessions: ", bold: true }),
-        new TextRun(String(sessionCount)),
+        new TextRun({ text: "Sessions: ", bold: true, font: "Aptos", size: 18 }),
+        new TextRun({ text: String(sessionCount), font: "Aptos", size: 18 }),
       ],
+      alignment: AlignmentType.RIGHT,
+      spacing: { after: 360 },
     }),
   ];
+}
+
+/**
+ * Merged compact header: title (48 Aptos Display) + span (24 Aptos after:480) + metadata (RIGHT 18 last 360).
+ * Spacer after:3600 removed.
+ */
+function titleAndMetaCompact(
+  serverName: string,
+  sessions: Session[],
+  generatedAt: string,
+  viewMode: ViewMode,
+  filterDesc: string
+): (Paragraph | Table)[] {
+  const titleChildren = titlePage(serverName, sessions);
+  const metaChildren = metadata(
+    generatedAt,
+    viewMode,
+    filterDesc,
+    sessions.length
+  );
+  return [...titleChildren, ...metaChildren];
+}
+
+/**
+ * Aesthetic message paragraph: 7 runs, after:60 + contextualSpacing, · separator.
+ * Pure helper for timelineBody + threadSubSections parity.
+ */
+function messageParagraph(entry: { channel: string; author: string; time: string; text: string }): Paragraph {
+  let timeText: string;
+  try {
+    timeText = formatMessageTime(entry.time);
+  } catch {
+    timeText = entry.time;
+  }
+  const bodyText = entry.text ?? "";
+  return new Paragraph({
+    spacing: { after: 60 },
+    contextualSpacing: true,
+    children: [
+      new TextRun({ text: `[${entry.channel}]`, font: "Aptos", size: 18, color: "808080" }),
+      new TextRun({ text: " ", font: "Aptos", size: 21 }),
+      new TextRun({ text: entry.author, font: "Aptos", size: 21, bold: true }),
+      new TextRun({ text: " ", font: "Aptos", size: 21 }),
+      new TextRun({ text: timeText, font: "Aptos", size: 18, italics: true, color: "808080" }),
+      new TextRun({ text: " · ", font: "Aptos", size: 18, color: "808080" }),
+      new TextRun({ text: bodyText, font: "Aptos", size: 21 }),
+    ],
+  });
+}
+
+function sessionHeading(idx: number, session: Session): Paragraph {
+  let span: string;
+  try {
+    span = formatSpan(session.start, session.end);
+  } catch {
+    span = `${session.start} — ${session.end}`;
+  }
+  return new Paragraph({
+    heading: HeadingLevel.HEADING_1,
+    spacing: { before: 240, after: 120 },
+    keepNext: true,
+    keepLines: true,
+    children: [
+      new TextRun({
+        text: `Session ${idx + 1} — ${span} (${session.timeline.length} mensagens)`,
+        font: "Aptos Display",
+        size: 28,
+        color: "404040",
+        bold: true,
+      }),
+    ],
+  });
 }
 
 /**
@@ -405,7 +705,8 @@ function metadata(
  */
 function timelineBody(
   sessions: Session[],
-  viewMode: ViewMode
+  viewMode: ViewMode,
+  baseDir: string = ""
 ): (Paragraph | Table)[] {
   const children: (Paragraph | Table)[] = [];
 
@@ -416,24 +717,63 @@ function timelineBody(
     return children;
   }
 
+  // Daily grouping: when multiple sessions grouped, render per-session HEADING_1 blocks
+  // so daily doc contains distinct session separators. Single session keeps prior behavior.
+  if (sessions.length > 1) {
+    // Chronological multi-session: sequential per-session with heading
+    if (viewMode === "chronological") {
+      sessions.forEach((session, idx) => {
+        children.push(sessionHeading(idx, session));
+        const sorted = [...session.timeline].sort((a, b) => {
+          const timeCmp = a.time.localeCompare(b.time);
+          return timeCmp !== 0 ? timeCmp : a.id.localeCompare(b.id);
+        });
+        for (const entry of sorted) {
+          children.push(messageParagraph(entry));
+          children.push(...tryEmbedImages(entry, baseDir));
+        }
+      });
+      return children;
+    }
+    // By-channel with multiple sessions: still per-session heading then by-channel inside each
+    for (const [idx, session] of sessions.entries()) {
+      children.push(sessionHeading(idx, session));
+      const byChannel = new Map<string, typeof session.timeline>();
+      for (const entry of session.timeline) {
+        const list = byChannel.get(entry.channel) ?? [];
+        list.push(entry);
+        byChannel.set(entry.channel, list);
+      }
+      for (const [channel, entries] of byChannel) {
+        entries.sort((a, b) => {
+          const timeCmp = a.time.localeCompare(b.time);
+          return timeCmp !== 0 ? timeCmp : a.id.localeCompare(b.id);
+        });
+        children.push(
+          new Paragraph({
+            children: [new TextRun(channel)],
+            heading: HeadingLevel.HEADING_2,
+          })
+        );
+        for (const entry of entries) {
+          children.push(messageParagraph(entry));
+          children.push(...tryEmbedImages(entry, baseDir));
+        }
+      }
+    }
+    return children;
+  }
+
   if (viewMode === "chronological") {
-    // Merge all session timelines, sort by (time, id)
+    // Merge all session timelines, sort by (time, id) — single session case
     const all = sessions.flatMap((s) => s.timeline);
     all.sort((a, b) => {
       const timeCmp = a.time.localeCompare(b.time);
       return timeCmp !== 0 ? timeCmp : a.id.localeCompare(b.id);
     });
     for (const entry of all) {
-      children.push(
-        new Paragraph({
-          children: [
-            new TextRun({ text: `[${entry.channel}] `, bold: true }),
-            new TextRun({ text: `${entry.author} `, bold: true }),
-            new TextRun({ text: `(${entry.time}): `, italics: true }),
-            new TextRun(entry.text),
-          ],
-        })
-      );
+      children.push(messageParagraph(entry));
+      children.push(...tryEmbedImages(entry, baseDir));
     }
   } else {
     // By-channel: group messages under channel headings
@@ -457,15 +797,8 @@ function timelineBody(
         })
       );
       for (const entry of entries) {
-        children.push(
-          new Paragraph({
-            children: [
-              new TextRun({ text: `${entry.author} `, bold: true }),
-              new TextRun({ text: `(${entry.time}): `, italics: true }),
-              new TextRun(entry.text),
-            ],
-          })
-        );
+        children.push(messageParagraph(entry));
+        children.push(...tryEmbedImages(entry, baseDir));
       }
     }
   }
@@ -476,7 +809,7 @@ function timelineBody(
 /**
  * Thread sub-sections: each topic as a distinct block with heading + entries.
  */
-function threadSubSections(sessions: Session[]): (Paragraph | Table)[] {
+function threadSubSections(sessions: Session[], baseDir: string = ""): (Paragraph | Table)[] {
   const children: (Paragraph | Table)[] = [];
   const allTopics = sessions.flatMap((s) => s.topics);
 
@@ -492,15 +825,8 @@ function threadSubSections(sessions: Session[]): (Paragraph | Table)[] {
       })
     );
     for (const entry of topic.timeline) {
-      children.push(
-        new Paragraph({
-          children: [
-            new TextRun({ text: `${entry.author} `, bold: true }),
-            new TextRun({ text: `(${entry.time}): `, italics: true }),
-            new TextRun(entry.text),
-          ],
-        })
-      );
+      children.push(messageParagraph(entry as any));
+      children.push(...tryEmbedImages(entry, baseDir));
     }
   }
 
@@ -569,16 +895,25 @@ function participantIndex(sessions: Session[]): (Paragraph | Table)[] {
 // ---------- buildSections ----------
 
 /**
- * Build the five document sections from resolved sessions.
+ * Build the four document sections from resolved sessions.
  *
- * Returns DocxSection[] in order: [titlePage, metadata, timelineBody,
- * threadSubSections, participantIndex].
+ * Returns DocxSection[] in order: [titleAndMetaCompact, timelineBody,
+ * threadSubSections, participantIndex]. First section merges title+metadata
+ * with spacer (size 32, after:3600). Tail sections use CONTINUOUS.
  */
 export function buildSections(
   sessions: Session[],
-  options: ReportOptions
+  options: ReportOptions,
+  baseDir?: string
 ): DocxSection[] {
   const serverName = options.serverName ?? "Session Report";
+
+  // Resolve baseDir: explicit arg wins, else dirname(inputPath) if present, else ""
+  const effectiveBase =
+    baseDir ??
+    ((options as unknown as { inputPath?: string }).inputPath
+      ? path.dirname((options as unknown as { inputPath: string }).inputPath)
+      : "");
 
   // Build filter description for metadata
   const filterParts: string[] = [];
@@ -590,21 +925,30 @@ export function buildSections(
     filterParts.push(`session=${options.sessionIndex}`);
   const filterDesc = filterParts.join("; ");
 
-  const generatedAt = new Date().toISOString();
+  const generatedAt = formatFooterTime(new Date());
 
   return [
-    { children: titlePage(serverName, sessions) },
     {
-      children: metadata(
+      children: titleAndMetaCompact(
+        serverName,
+        sessions,
         generatedAt,
         options.viewMode,
-        filterDesc,
-        sessions.length
+        filterDesc
       ),
     },
-    { children: timelineBody(sessions, options.viewMode) },
-    { children: threadSubSections(sessions) },
-    { children: participantIndex(sessions) },
+    {
+      children: timelineBody(sessions, options.viewMode, effectiveBase),
+      properties: { type: SectionType.CONTINUOUS },
+    },
+    {
+      children: threadSubSections(sessions, effectiveBase),
+      properties: { type: SectionType.CONTINUOUS },
+    },
+    {
+      children: participantIndex(sessions),
+      properties: { type: SectionType.CONTINUOUS },
+    },
   ];
 }
 
@@ -663,20 +1007,26 @@ export async function main(
   );
 
   // Build and write output.
+  const baseDir = path.dirname(args.inputPath);
   if (args.output) {
-    // Single explicit --output path: one document containing all filtered sessions.
-    const sections = buildSections(resolved, args);
+    // Single explicit --output path: one document containing all filtered sessions (bypasses grouping).
+    const sections = buildSections(resolved, args, baseDir);
     const doc = new Document({ sections });
     const buffer = await Packer.toBuffer(doc);
     io.mkdirSync(path.dirname(args.output), { recursive: true });
     io.writeFileSync(args.output, buffer);
   } else {
-    // No --output: one DOCX per session, each containing ONLY that session (D1).
-    for (const session of resolved) {
-      const sections = buildSections([session], args);
+    // No --output: daily grouping via groupSessionsByDay (filters before grouping).
+    if (resolved.length === 0) {
+      io.exit(0);
+      return;
+    }
+    const grouped = groupSessionsByDay(resolved, TZ);
+    for (const [day, daySessions] of grouped) {
+      const sections = buildSections(daySessions, args, baseDir);
       const doc = new Document({ sections });
       const buffer = await Packer.toBuffer(doc);
-      const outPath = computeOutputPath(args, session, output.guildId);
+      const outPath = computeDailyOutputPath(args.serverName, day, output.guildId);
       io.mkdirSync(path.dirname(outPath), { recursive: true });
       io.writeFileSync(outPath, buffer);
     }

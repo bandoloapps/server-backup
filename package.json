@@ -9,7 +9,8 @@
     "start": "node .",
     "decrypt": "node decryptDb.js",
     "export": "node dist/export/exportMessages.js",
-    "report": "node dist/export/generateReport.js"
+    "report": "node dist/export/generateReport.js",
+    "test": "npx tsx --test src/export/generateReport.test.ts src/export/exportMessages.test.ts"
   },
   "keywords": [
     "Discord Server Backup",
@@ -26,6 +27,7 @@
     "discord.js": "^14.14.1",
     "docx": "^9.7.1",
     "dotenv": "^16.3.1",
+    "image-size": "^1.1.1",
     "sequelize": "^6.35.2",
     "sqlite3": "^5.1.6"
   },
