@@ -93,7 +93,7 @@ export function computeDailyOutputPath(
 ): string {
   const raw = serverName ?? guildId ?? "unknown";
   const sanitized = raw.replace(/[^a-zA-Z0-9-_]/g, "_");
-  return path.join("exports", sanitized, day, `daily-${day}.docx`);
+  return path.join("exports", sanitized, `daily-${day}.docx`);
 }
 
 // ---------- pure functions ----------

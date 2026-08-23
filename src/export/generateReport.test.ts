@@ -373,24 +373,24 @@ describe("groupSessionsByDay", () => {
 // ---------- computeDailyOutputPath ----------
 
 describe("computeDailyOutputPath", () => {
-  it("sanitizes MyServer → exports/MyServer/YYYY-MM-DD/daily-YYYY-MM-DD.docx", () => {
+  it("sanitizes MyServer → exports/MyServer/daily-YYYY-MM-DD.docx (flat)", () => {
     const p = computeDailyOutputPath("MyServer", "2026-08-20", "guild-1");
-    assert.equal(p, "exports/MyServer/2026-08-20/daily-2026-08-20.docx");
+    assert.equal(p, "exports/MyServer/daily-2026-08-20.docx");
   });
 
-  it("falls back to guildId 123456", () => {
+  it("falls back to guildId 123456 (flat)", () => {
     const p = computeDailyOutputPath(null, "2026-08-20", "123456");
-    assert.match(p, /exports\/123456\/2026-08-20\/daily-2026-08-20\.docx/);
+    assert.equal(p, "exports/123456/daily-2026-08-20.docx");
   });
 
-  it("falls back to unknown when no names", () => {
+  it("falls back to unknown when no names (flat)", () => {
     const p = computeDailyOutputPath(null, "2026-08-20", null);
-    assert.match(p, /exports\/unknown\/2026-08-20\/daily-2026-08-20\.docx/);
+    assert.equal(p, "exports/unknown/daily-2026-08-20.docx");
   });
 
-  it("sanitizes special chars", () => {
+  it("sanitizes special chars (flat)", () => {
     const p = computeDailyOutputPath("My Server!", "2026-08-20", null);
-    assert.match(p, /exports\/My_Server_\/2026-08-20\/daily-2026-08-20\.docx/);
+    assert.equal(p, "exports/My_Server_/daily-2026-08-20.docx");
     assert.ok(!p.includes(" "), "no spaces in sanitized path");
   });
 });
@@ -777,10 +777,10 @@ describe("main daily grouping (2A)", () => {
     };
     await main(["--server-name", "MyServer"], io);
     assert.equal(writtenPaths.length, 1, "same day must be 1 daily doc");
-    assert.match(writtenPaths[0], /exports\/MyServer\/2026-08-20\/daily-2026-08-20\.docx/);
+    assert.equal(writtenPaths[0], "exports/MyServer/daily-2026-08-20.docx");
   });
 
-  it("cross SP day → 2 daily docs", async () => {
+  it("cross SP day → 2 daily docs (flat)", async () => {
     const output = makeOutput({
       sessions: [
         { ...makeOutput().sessions[0], start: "2026-08-20T10:00:00Z", end: "2026-08-20T11:00:00Z", timeline: [{ ...makeOutput().sessions[0].timeline[0], time: "2026-08-20T10:00:00Z" }], topics: [] },
@@ -796,8 +796,8 @@ describe("main daily grouping (2A)", () => {
     };
     await main([], io);
     assert.equal(writtenPaths.length, 2, "cross day must be 2 docs");
-    assert.ok(writtenPaths.some(p => p.includes("2026-08-20")), "must have 2026-08-20");
-    assert.ok(writtenPaths.some(p => p.includes("2026-08-21")), "must have 2026-08-21");
+    assert.ok(writtenPaths.includes("exports/guild-1/daily-2026-08-20.docx"), "must have flat 2026-08-20");
+    assert.ok(writtenPaths.includes("exports/guild-1/daily-2026-08-21.docx"), "must have flat 2026-08-21");
   });
 
   it("--output bypasses grouping → single doc", async () => {
@@ -820,7 +820,7 @@ describe("main daily grouping (2A)", () => {
     assert.equal(writtenPaths[0], "/tmp/report.docx");
   });
 
-  it("--session 0 filters before grouping → only that session's day", async () => {
+  it("--session 0 filters before grouping → only that session's day (flat)", async () => {
     const output = makeOutput({
       sessions: [
         { ...makeOutput().sessions[0], start: "2026-08-20T10:00:00Z", end: "2026-08-20T11:00:00Z", timeline: [{ ...makeOutput().sessions[0].timeline[0], time: "2026-08-20T10:00:00Z" }], topics: [] },
@@ -837,7 +837,7 @@ describe("main daily grouping (2A)", () => {
     };
     await main(["--session", "0"], io);
     assert.equal(writtenPaths.length, 1, "--session 0 + daily same day => 1 doc");
-    assert.match(writtenPaths[0], /2026-08-20\/daily-2026-08-20\.docx/);
+    assert.equal(writtenPaths[0], "exports/guild-1/daily-2026-08-20.docx");
   });
 
   it("zero-filter without --output → zero files exit 0", async () => {
@@ -855,7 +855,7 @@ describe("main daily grouping (2A)", () => {
     assert.equal(exitCode, 0);
   });
 
-  it("guildId fallback in daily path", async () => {
+  it("guildId fallback in daily path (flat)", async () => {
     const output = makeOutput({ guildId: "123456" });
     // single session on 2026-08-20
     output.sessions[0].start = "2026-08-20T10:00:00Z";
@@ -869,6 +869,37 @@ describe("main daily grouping (2A)", () => {
     };
     await main([], io);
     assert.equal(writtenPaths.length, 1);
-    assert.match(writtenPaths[0], /exports\/123456\/2026-08-20\/daily-2026-08-20\.docx/);
+    assert.equal(writtenPaths[0], "exports/123456/daily-2026-08-20.docx");
+  });
+
+  it("re-export overwrites idempotently (flat) + lex sort chronological", async () => {
+    const output = makeOutput({
+      sessions: [
+        { ...makeOutput().sessions[0], start: "2026-08-20T10:00:00Z", end: "2026-08-20T11:00:00Z", timeline: [{ ...makeOutput().sessions[0].timeline[0], time: "2026-08-20T10:00:00Z", text: "v1" }], topics: [] },
+      ],
+    });
+    const writtenPaths: string[] = [];
+    const mkdirPaths: string[] = [];
+    let writeCount = 0;
+    const io: ReportIO = {
+      readFileSync: (_p: string, _enc: string) => JSON.stringify(output),
+      writeFileSync: (p: string, _data: Buffer) => { writtenPaths.push(p); writeCount++; },
+      mkdirSync: (p: string, _opts: any) => { mkdirPaths.push(p); },
+      exit: (code: number) => { if (code !== 0) throw new Error(`exit(${code})`); },
+    };
+    await main(["--server-name", "MyServer"], io);
+    assert.equal(writtenPaths.length, 1);
+    assert.equal(writtenPaths[0], "exports/MyServer/daily-2026-08-20.docx");
+    assert.ok(mkdirPaths.includes("exports/MyServer"), "mkdir must be flat parent exports/<server> not dated subdir");
+    assert.ok(!mkdirPaths.some(p => p.includes("2026-08-20")), "mkdir must not create dated subdir");
+    // re-export same day: overwrite without error — count would be 2 after second run
+    writtenPaths.length = 0;
+    mkdirPaths.length = 0;
+    await main(["--server-name", "MyServer"], io);
+    assert.equal(writtenPaths.length, 1, "re-export must overwrite same flat file");
+    assert.equal(writeCount, 2, "write called twice (idempotent overwrite)");
+    // lex sort == chronological due to daily-YYYY-MM-DD prefix
+    const flatFiles = ["exports/MyServer/daily-2026-08-20.docx", "exports/MyServer/daily-2026-08-19.docx", "exports/MyServer/daily-2026-08-18.docx"];
+    assert.deepEqual([...flatFiles].sort(), ["exports/MyServer/daily-2026-08-18.docx", "exports/MyServer/daily-2026-08-19.docx", "exports/MyServer/daily-2026-08-20.docx"]);
   });
 });
