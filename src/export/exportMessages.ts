@@ -239,6 +239,25 @@ export const sniffMagic = (buf: Buffer, ext: string): boolean => {
 
 export const sanitizeName = (name: string): string => name.replace(/[^a-zA-Z0-9._-]/g, "_");
 
+/** Truncate `${messageId}__${sanitized}` to `maxBase` (default 200) preserving ext and prefix + hash for uniqueness. */
+export const truncateFileName = (messageId: string, sanitized: string, maxBase = 200): string => {
+    const prefix = `${messageId}__`;
+    const fileName = `${prefix}${sanitized}`;
+    if (fileName.length <= maxBase) return fileName;
+    const dot = sanitized.lastIndexOf(".");
+    const extWithDot = dot >= 0 && dot < sanitized.length - 1 ? sanitized.slice(dot) : "";
+    const stem = extWithDot ? sanitized.slice(0, -extWithDot.length) : sanitized;
+    const maxStem = maxBase - prefix.length - extWithDot.length;
+    if (maxStem <= 0) return `${prefix.slice(0, maxBase - extWithDot.length)}${extWithDot}`.slice(0, maxBase);
+    if (stem.length <= maxStem) return `${prefix}${stem}${extWithDot}`;
+    const hash = crypto.createHash("sha256").update(sanitized).digest("hex").slice(0, 8);
+    if (maxStem <= hash.length + 1) {
+        return `${prefix}${stem.slice(0, maxStem)}${extWithDot}`;
+    }
+    const keep = maxStem - hash.length - 1; // 1 for '-'
+    return `${prefix}${stem.slice(0, keep)}-${hash}${extWithDot}`;
+};
+
 const extToContentType = (ext: string): string | null => {
     const e = ext.replace(/^\./, "").toLowerCase();
     if (e === "png") return "image/png";
@@ -252,7 +271,9 @@ export const writeImageAtomic = (dst: string, data: Buffer): void => {
     const dir = path.dirname(dst);
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     try { fs.chmodSync(dir, 0o700); } catch {}
-    const tmp = path.join(dir, `.tmp-${path.basename(dst)}-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const basename = path.basename(dst);
+    const hash = crypto.createHash("sha256").update(basename).digest("hex").slice(0, 12);
+    const tmp = path.join(dir, `.tmp-${hash}-${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2, 6)}`);
     const fd = fs.openSync(tmp, "w", 0o600);
     try {
         fs.writeSync(fd, data);
@@ -654,7 +675,7 @@ export const decryptAndMaterializeImages = (
         const ext = att.name.slice(att.name.lastIndexOf(".") + 1);
         if (!sniffMagic(raw, ext)) continue;
         const sanitized = sanitizeName(att.name);
-        const fileName = `${att.messageId}__${sanitized}`;
+        const fileName = truncateFileName(att.messageId, sanitized, 200);
         const relPath = `images/${fileName}`;
         const dst = path.join(outDir, relPath);
         const contentType = extToContentType(ext);
