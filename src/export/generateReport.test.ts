@@ -6,6 +6,10 @@ import {
   filterSessions,
   resolveNames,
   computeOutputPath,
+  computeDailyOutputPath,
+  formatDay,
+  groupSessionsByDay,
+  TZ,
   parseReportArgs,
   buildSections,
   main,
@@ -13,6 +17,7 @@ import {
   type ReportIO,
   type ReportOptions,
 } from "./generateReport";
+import { SectionType } from "docx";
 
 // ---------- fixtures ----------
 
@@ -301,6 +306,95 @@ describe("computeOutputPath", () => {
   });
 });
 
+// ---------- formatDay ----------
+
+describe("formatDay", () => {
+  it("converts 02:00Z to previous SP day 2026-08-18", () => {
+    assert.equal(formatDay("2026-08-19T02:00:00Z", "America/Sao_Paulo"), "2026-08-18");
+  });
+
+  it("midnight 00:00Z maps to previous SP day (2026-08-19)", () => {
+    assert.equal(formatDay("2026-08-20T00:00:00Z", "America/Sao_Paulo"), "2026-08-19");
+  });
+
+  it("handles fallback timeline time 2026-08-20T12:00Z", () => {
+    assert.equal(formatDay("2026-08-20T12:00:00Z", "America/Sao_Paulo"), "2026-08-20");
+  });
+
+  it("exposes TZ constant as America/Sao_Paulo", () => {
+    assert.equal(TZ, "America/Sao_Paulo");
+  });
+});
+
+// ---------- groupSessionsByDay ----------
+
+describe("groupSessionsByDay", () => {
+  function makeSession(start: string, time: string): any {
+    return {
+      start,
+      end: time,
+      channelIds: ["c1"],
+      timeline: [{ id: "m1", channelId: "c1", authorId: "u1", author: "Alice", channel: "general", time, text: "hi" }],
+      topics: [],
+    };
+  }
+
+  it("same SP day → 1 key with 2 sessions", () => {
+    const s1 = makeSession("2026-08-20T10:00:00Z", "2026-08-20T10:00:00Z");
+    const s2 = makeSession("2026-08-20T15:00:00Z", "2026-08-20T15:00:00Z");
+    const grouped = groupSessionsByDay([s1, s2], "America/Sao_Paulo");
+    assert.equal(grouped.size, 1);
+    assert.equal(grouped.get("2026-08-20")!.length, 2);
+  });
+
+  it("cross SP day → 2 keys", () => {
+    const s1 = makeSession("2026-08-20T10:00:00Z", "2026-08-20T10:00:00Z");
+    const s2 = makeSession("2026-08-21T10:00:00Z", "2026-08-21T10:00:00Z");
+    const grouped = groupSessionsByDay([s1, s2], "America/Sao_Paulo");
+    assert.equal(grouped.size, 2);
+    assert.ok(grouped.has("2026-08-20"));
+    assert.ok(grouped.has("2026-08-21"));
+  });
+
+  it("empty start falls back to timeline[0].time", () => {
+    const s = makeSession("", "2026-08-20T12:00:00Z");
+    const grouped = groupSessionsByDay([s], "America/Sao_Paulo");
+    assert.equal(grouped.size, 1);
+    assert.ok(grouped.has("2026-08-20"));
+  });
+
+  it("timezone conversion 02:00Z → 2026-08-18 key", () => {
+    const s = makeSession("2026-08-19T02:00:00Z", "2026-08-19T02:00:00Z");
+    const grouped = groupSessionsByDay([s], "America/Sao_Paulo");
+    assert.ok(grouped.has("2026-08-18"), "should bucket to previous SP day");
+  });
+});
+
+// ---------- computeDailyOutputPath ----------
+
+describe("computeDailyOutputPath", () => {
+  it("sanitizes MyServer → exports/MyServer/YYYY-MM-DD/daily-YYYY-MM-DD.docx", () => {
+    const p = computeDailyOutputPath("MyServer", "2026-08-20", "guild-1");
+    assert.equal(p, "exports/MyServer/2026-08-20/daily-2026-08-20.docx");
+  });
+
+  it("falls back to guildId 123456", () => {
+    const p = computeDailyOutputPath(null, "2026-08-20", "123456");
+    assert.match(p, /exports\/123456\/2026-08-20\/daily-2026-08-20\.docx/);
+  });
+
+  it("falls back to unknown when no names", () => {
+    const p = computeDailyOutputPath(null, "2026-08-20", null);
+    assert.match(p, /exports\/unknown\/2026-08-20\/daily-2026-08-20\.docx/);
+  });
+
+  it("sanitizes special chars", () => {
+    const p = computeDailyOutputPath("My Server!", "2026-08-20", null);
+    assert.match(p, /exports\/My_Server_\/2026-08-20\/daily-2026-08-20\.docx/);
+    assert.ok(!p.includes(" "), "no spaces in sanitized path");
+  });
+});
+
 // ---------- parseReportArgs ----------
 
 describe("parseReportArgs", () => {
@@ -393,7 +487,7 @@ describe("buildSections", () => {
     const session = output.sessions[0];
     const resolved = resolveNames(session, output.users, output.channels);
     const sections = buildSections([resolved], makeOptions());
-    assert.equal(sections.length, 5);
+    assert.equal(sections.length, 4);
     // Verify section types by checking children arrays exist
     for (const s of sections) {
       assert.ok(Array.isArray(s.children), "each section must have children array");
@@ -405,7 +499,7 @@ describe("buildSections", () => {
     const session = output.sessions[0];
     const resolved = resolveNames(session, output.users, output.channels);
     const sections = buildSections([resolved], makeOptions({ viewMode: "by-channel" }));
-    assert.equal(sections.length, 5);
+    assert.equal(sections.length, 4);
   });
 
   it("title section contains server name", () => {
@@ -438,8 +532,8 @@ describe("buildSections", () => {
     session.timeline = [session.timeline[1], session.timeline[0]];
     const resolved = resolveNames(session, output.users, output.channels);
     const sections = buildSections([resolved], makeOptions({ viewMode: "chronological" }));
-    // Timeline body is section index 2 (after title + metadata)
-    const timelineSection = sections[2];
+    // Timeline body is section index 1 (after compact header)
+    const timelineSection = sections[1];
     assert.ok(timelineSection, "timeline section must exist");
     assert.ok(timelineSection.children.length > 0, "timeline must have content");
   });
@@ -452,7 +546,7 @@ describe("buildSections", () => {
       [resolved],
       makeOptions({ viewMode: "by-channel" })
     );
-    const timelineSection = sections[2];
+    const timelineSection = sections[1];
     assert.ok(timelineSection, "timeline section must exist");
     assert.ok(timelineSection.children.length > 0, "timeline must have content");
   });
@@ -482,9 +576,9 @@ describe("buildSections", () => {
     };
     const resolved = resolveNames(session, output.users, output.channels);
     const sections = buildSections([resolved], makeOptions());
-    // Sections: [title, metadata, timeline, threads, participants]
-    assert.equal(sections.length, 5);
-    const threadsSection = sections[3];
+    // Sections: [titleAndMetaCompact, timeline, threads, participants]
+    assert.equal(sections.length, 4);
+    const threadsSection = sections[2];
     assert.ok(threadsSection, "threads section must exist");
     assert.ok(threadsSection.children.length > 0, "threads must have content when topics exist");
   });
@@ -494,10 +588,58 @@ describe("buildSections", () => {
     const session = output.sessions[0];
     const resolved = resolveNames(session, output.users, output.channels);
     const sections = buildSections([resolved], makeOptions());
-    // Participant index is section 4
-    const participantSection = sections[4];
+    // Participant index is section 3
+    const participantSection = sections[3];
     assert.ok(participantSection, "participant section must exist");
     assert.ok(participantSection.children.length > 0, "participants must have content");
+  });
+});
+
+describe("buildSections compact header (1A)", () => {
+  it("returns 4 sections with merged header", () => {
+    const output = makeOutput();
+    const resolved = resolveNames(output.sessions[0], output.users, output.channels);
+    const sections = buildSections([resolved], makeOptions({ serverName: "CompactTest" }));
+    assert.equal(sections.length, 4, "must be 4 sections titleAndMetaCompact, timelineBody, threadSubSections, participantIndex");
+    // first section must contain title, spacer, metadata, timeline start marker
+    const firstJson = JSON.stringify(sections[0].children.map((c: any) => c.root ?? c));
+    assert.ok(firstJson.includes("CompactTest"), "first section must contain server name");
+    assert.ok(firstJson.includes("Generated"), "first section must contain metadata");
+  });
+
+  it("title size 32 and spacer spacing.after 3600", () => {
+    const output = makeOutput();
+    const resolved = resolveNames(output.sessions[0], output.users, output.channels);
+    const sections = buildSections([resolved], makeOptions());
+    const firstJson = JSON.stringify(sections[0].children.map((c: any) => c.root ?? c));
+    // Title size 32: docx TextRun size is serialized as w:sz with val 32
+    assert.ok(firstJson.includes('"val":32') || firstJson.includes('"size":32') || firstJson.includes("32"), "title must be size 32, got json: " + firstJson.slice(0, 500));
+    // Spacer spacing.after 3600
+    const hasSpacer = sections[0].children.some((c: any) => {
+      const j = JSON.stringify(c.root ?? c);
+      return j.includes("3600");
+    });
+    assert.ok(hasSpacer, "first section must contain spacer with spacing.after 3600");
+  });
+
+  it("tail sections are CONTINUOUS", () => {
+    const output = makeOutput();
+    const resolved = resolveNames(output.sessions[0], output.users, output.channels);
+    const sections = buildSections([resolved], makeOptions());
+    assert.equal(sections.length, 4);
+    for (let i = 1; i < sections.length; i++) {
+      assert.equal(sections[i].properties?.type, SectionType.CONTINUOUS, `section ${i} must be CONTINUOUS`);
+    }
+  });
+
+  it("empty sessions → 4 sections header 0 sessions timeline on p1", () => {
+    const sections = buildSections([], makeOptions({ serverName: "Empty" }));
+    assert.equal(sections.length, 4, "empty must still be 4 sections");
+    const firstJson = JSON.stringify(sections[0].children.map((c: any) => c.root ?? c));
+    assert.ok(firstJson.includes("0 sessions") || firstJson.includes("No sessions"), "header must show 0 sessions");
+    for (let i = 1; i < sections.length; i++) {
+      assert.equal(sections[i].properties?.type, SectionType.CONTINUOUS);
+    }
   });
 });
 
@@ -525,10 +667,11 @@ describe("main", () => {
   });
 
   it("writes one DOCX per session when no --session flag", async () => {
+    // Daily grouping: 2 sessions on different SP days → 2 daily docs
     const output = makeOutput({
       sessions: [
         { ...makeOutput().sessions[0], start: "2026-08-19T18:00:00.000Z", end: "2026-08-19T19:00:00.000Z", timeline: [{ ...makeOutput().sessions[0].timeline[0], time: "2026-08-19T18:00:00.000Z" }], topics: [] },
-        makeOutput().sessions[0],
+        { ...makeOutput().sessions[0], start: "2026-08-20T18:00:00.000Z", end: "2026-08-20T19:00:00.000Z", timeline: [{ ...makeOutput().sessions[0].timeline[0], id: "m2b", time: "2026-08-20T18:00:00.000Z", text: "second day" }], topics: [] },
       ],
     });
     const writtenPaths: string[] = [];
@@ -542,16 +685,16 @@ describe("main", () => {
     };
 
     await main(["--server-name", "TestServer"], io);
-    assert.equal(writtenPaths.length, 2, "must write one file per session");
-    assert.equal(writtenBuffers.length, 2, "must produce one buffer per session");
-    // Each path should contain the session slug
-    assert.ok(writtenPaths[0].includes("session-"), "first file must be a session docx");
-    assert.ok(writtenPaths[1].includes("session-"), "second file must be a session docx");
-    // Each DOCX must contain only its own session — the two buffers must differ.
+    assert.equal(writtenPaths.length, 2, "must write one file per day");
+    assert.equal(writtenBuffers.length, 2, "must produce one buffer per day");
+    // Each path should be daily-YYYY-MM-DD.docx
+    assert.ok(writtenPaths[0].includes("daily-"), "first file must be a daily docx");
+    assert.ok(writtenPaths[1].includes("daily-"), "second file must be a daily docx");
+    // Each DOCX must contain only its day's session — the two buffers must differ.
     assert.notEqual(
       writtenBuffers[0].toString("hex"),
       writtenBuffers[1].toString("hex"),
-      "each session DOCX must render only that session (buffers must differ)"
+      "each daily DOCX must render only that day (buffers must differ)"
     );
   });
 
@@ -614,5 +757,118 @@ describe("main", () => {
 
     await main([], io);
     assert.equal(exitCode, 1, "must exit 1 on unsupported schema version");
+  });
+});
+
+describe("main daily grouping (2A)", () => {
+  it("same SP day → 1 daily doc with both sessions", async () => {
+    const output = makeOutput({
+      sessions: [
+        { ...makeOutput().sessions[0], start: "2026-08-20T10:00:00Z", end: "2026-08-20T11:00:00Z", timeline: [{ ...makeOutput().sessions[0].timeline[0], time: "2026-08-20T10:00:00Z" }], topics: [] },
+        { ...makeOutput().sessions[0], start: "2026-08-20T15:00:00Z", end: "2026-08-20T16:00:00Z", timeline: [{ ...makeOutput().sessions[0].timeline[0], id: "mX", time: "2026-08-20T15:00:00Z", text: "second" }], topics: [] },
+      ],
+    });
+    const writtenPaths: string[] = [];
+    const io: ReportIO = {
+      readFileSync: (_p: string, _enc: string) => JSON.stringify(output),
+      writeFileSync: (p: string, _data: Buffer) => { writtenPaths.push(p); },
+      mkdirSync: (_p: string, _opts: any) => {},
+      exit: (code: number) => { if (code !== 0) throw new Error(`exit(${code})`); },
+    };
+    await main(["--server-name", "MyServer"], io);
+    assert.equal(writtenPaths.length, 1, "same day must be 1 daily doc");
+    assert.match(writtenPaths[0], /exports\/MyServer\/2026-08-20\/daily-2026-08-20\.docx/);
+  });
+
+  it("cross SP day → 2 daily docs", async () => {
+    const output = makeOutput({
+      sessions: [
+        { ...makeOutput().sessions[0], start: "2026-08-20T10:00:00Z", end: "2026-08-20T11:00:00Z", timeline: [{ ...makeOutput().sessions[0].timeline[0], time: "2026-08-20T10:00:00Z" }], topics: [] },
+        { ...makeOutput().sessions[0], start: "2026-08-21T10:00:00Z", end: "2026-08-21T11:00:00Z", timeline: [{ ...makeOutput().sessions[0].timeline[0], id: "mX", time: "2026-08-21T10:00:00Z" }], topics: [] },
+      ],
+    });
+    const writtenPaths: string[] = [];
+    const io: ReportIO = {
+      readFileSync: (_p: string, _enc: string) => JSON.stringify(output),
+      writeFileSync: (p: string, _data: Buffer) => { writtenPaths.push(p); },
+      mkdirSync: (_p: string, _opts: any) => {},
+      exit: (code: number) => { if (code !== 0) throw new Error(`exit(${code})`); },
+    };
+    await main([], io);
+    assert.equal(writtenPaths.length, 2, "cross day must be 2 docs");
+    assert.ok(writtenPaths.some(p => p.includes("2026-08-20")), "must have 2026-08-20");
+    assert.ok(writtenPaths.some(p => p.includes("2026-08-21")), "must have 2026-08-21");
+  });
+
+  it("--output bypasses grouping → single doc", async () => {
+    const output = makeOutput({
+      sessions: [
+        { ...makeOutput().sessions[0], start: "2026-08-20T10:00:00Z", end: "2026-08-20T11:00:00Z", timeline: [{ ...makeOutput().sessions[0].timeline[0], time: "2026-08-20T10:00:00Z" }], topics: [] },
+        { ...makeOutput().sessions[0], start: "2026-08-21T10:00:00Z", end: "2026-08-21T11:00:00Z", timeline: [{ ...makeOutput().sessions[0].timeline[0], id: "mX", time: "2026-08-21T10:00:00Z" }], topics: [] },
+        { ...makeOutput().sessions[0], start: "2026-08-22T10:00:00Z", end: "2026-08-22T11:00:00Z", timeline: [{ ...makeOutput().sessions[0].timeline[0], id: "mY", time: "2026-08-22T10:00:00Z" }], topics: [] },
+      ],
+    });
+    const writtenPaths: string[] = [];
+    const io: ReportIO = {
+      readFileSync: (_p: string, _enc: string) => JSON.stringify(output),
+      writeFileSync: (p: string, _data: Buffer) => { writtenPaths.push(p); },
+      mkdirSync: (_p: string, _opts: any) => {},
+      exit: (code: number) => { if (code !== 0) throw new Error(`exit(${code})`); },
+    };
+    await main(["--output", "/tmp/report.docx"], io);
+    assert.equal(writtenPaths.length, 1);
+    assert.equal(writtenPaths[0], "/tmp/report.docx");
+  });
+
+  it("--session 0 filters before grouping → only that session's day", async () => {
+    const output = makeOutput({
+      sessions: [
+        { ...makeOutput().sessions[0], start: "2026-08-20T10:00:00Z", end: "2026-08-20T11:00:00Z", timeline: [{ ...makeOutput().sessions[0].timeline[0], time: "2026-08-20T10:00:00Z" }], topics: [] },
+        { ...makeOutput().sessions[0], start: "2026-08-20T15:00:00Z", end: "2026-08-20T16:00:00Z", timeline: [{ ...makeOutput().sessions[0].timeline[0], id: "mX", time: "2026-08-20T15:00:00Z" }], topics: [] },
+        { ...makeOutput().sessions[0], start: "2026-08-20T18:00:00Z", end: "2026-08-20T19:00:00Z", timeline: [{ ...makeOutput().sessions[0].timeline[0], id: "mY", time: "2026-08-20T18:00:00Z" }], topics: [] },
+      ],
+    });
+    const writtenPaths: string[] = [];
+    const io: ReportIO = {
+      readFileSync: (_p: string, _enc: string) => JSON.stringify(output),
+      writeFileSync: (p: string, _data: Buffer) => { writtenPaths.push(p); },
+      mkdirSync: (_p: string, _opts: any) => {},
+      exit: (code: number) => { if (code !== 0) throw new Error(`exit(${code})`); },
+    };
+    await main(["--session", "0"], io);
+    assert.equal(writtenPaths.length, 1, "--session 0 + daily same day => 1 doc");
+    assert.match(writtenPaths[0], /2026-08-20\/daily-2026-08-20\.docx/);
+  });
+
+  it("zero-filter without --output → zero files exit 0", async () => {
+    const output = makeOutput();
+    const writtenPaths: string[] = [];
+    let exitCode: number | null = null;
+    const io: ReportIO = {
+      readFileSync: (_p: string, _enc: string) => JSON.stringify(output),
+      writeFileSync: (p: string, _data: Buffer) => { writtenPaths.push(p); },
+      mkdirSync: (_p: string, _opts: any) => {},
+      exit: (code: number) => { exitCode = code; },
+    };
+    await main(["--session", "99"], io);
+    assert.equal(writtenPaths.length, 0, "zero filter must write 0 files");
+    assert.equal(exitCode, 0);
+  });
+
+  it("guildId fallback in daily path", async () => {
+    const output = makeOutput({ guildId: "123456" });
+    // single session on 2026-08-20
+    output.sessions[0].start = "2026-08-20T10:00:00Z";
+    output.sessions[0].end = "2026-08-20T11:00:00Z";
+    const writtenPaths: string[] = [];
+    const io: ReportIO = {
+      readFileSync: (_p: string, _enc: string) => JSON.stringify(output),
+      writeFileSync: (p: string, _data: Buffer) => { writtenPaths.push(p); },
+      mkdirSync: (_p: string, _opts: any) => {},
+      exit: (code: number) => { if (code !== 0) throw new Error(`exit(${code})`); },
+    };
+    await main([], io);
+    assert.equal(writtenPaths.length, 1);
+    assert.match(writtenPaths[0], /exports\/123456\/2026-08-20\/daily-2026-08-20\.docx/);
   });
 });

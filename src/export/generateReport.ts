@@ -19,6 +19,7 @@ import {
   TableLayoutType,
   WidthType,
   AlignmentType,
+  SectionType,
   type ISectionPropertiesOptions,
 } from "docx";
 import { ExportOutput, Session } from "./exportMessages";
@@ -53,6 +54,47 @@ export interface DocxSection {
 // ---------- constants ----------
 
 const SUPPORTED_SCHEMA_VERSIONS = new Set(["1"]);
+
+export const TZ = "America/Sao_Paulo" as const;
+
+export function formatDay(isoTime: string, timeZone: string): string {
+  const d = new Date(isoTime);
+  if (Number.isNaN(d.getTime())) throw new Error(`invalid date: ${isoTime}`);
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  return fmt.format(d);
+}
+
+export function groupSessionsByDay(
+  sessions: Session[],
+  timeZone: string
+): Map<string, Session[]> {
+  const map = new Map<string, Session[]>();
+  for (const s of sessions) {
+    const rawIso =
+      s.start && s.start.trim() !== "" ? s.start : (s.timeline[0]?.time ?? "");
+    if (!rawIso) continue;
+    const day = formatDay(rawIso, timeZone);
+    const arr = map.get(day) ?? [];
+    arr.push(s);
+    map.set(day, arr);
+  }
+  return map;
+}
+
+export function computeDailyOutputPath(
+  serverName: string | null,
+  day: string,
+  guildId?: string | null
+): string {
+  const raw = serverName ?? guildId ?? "unknown";
+  const sanitized = raw.replace(/[^a-zA-Z0-9-_]/g, "_");
+  return path.join("exports", sanitized, day, `daily-${day}.docx`);
+}
 
 // ---------- pure functions ----------
 
@@ -321,6 +363,7 @@ function formatSlug(isoTime: string): string {
 
 /**
  * Title page: server name + session span (first → last message time).
+ * Size 32 for compact header (was 48).
  */
 function titlePage(
   serverName: string,
@@ -330,7 +373,7 @@ function titlePage(
 
   children.push(
     new Paragraph({
-      children: [new TextRun({ text: serverName, bold: true, size: 48 })],
+      children: [new TextRun({ text: serverName, bold: true, size: 32 })],
       heading: HeadingLevel.TITLE,
       alignment: AlignmentType.CENTER,
     })
@@ -399,6 +442,31 @@ function metadata(
 }
 
 /**
+ * Merged compact header: title (32) + span + spacer (after:3600) + metadata.
+ * Spacer is an empty paragraph with spacing.after 3600 (~6.3cm, ~50% page).
+ */
+function titleAndMetaCompact(
+  serverName: string,
+  sessions: Session[],
+  generatedAt: string,
+  viewMode: ViewMode,
+  filterDesc: string
+): (Paragraph | Table)[] {
+  const titleChildren = titlePage(serverName, sessions);
+  const spacer = new Paragraph({
+    children: [],
+    spacing: { after: 3600 },
+  });
+  const metaChildren = metadata(
+    generatedAt,
+    viewMode,
+    filterDesc,
+    sessions.length
+  );
+  return [...titleChildren, spacer, ...metaChildren];
+}
+
+/**
  * Timeline body: messages rendered per view mode.
  * Chronological: single merged timeline sorted by (time, id).
  * By-channel: H2 per channel with that channel's messages.
@@ -416,8 +484,90 @@ function timelineBody(
     return children;
   }
 
+  // Daily grouping: when multiple sessions grouped, render per-session HEADING_1 blocks
+  // so daily doc contains distinct session separators. Single session keeps prior behavior.
+  if (sessions.length > 1) {
+    // Chronological multi-session: sequential per-session with heading
+    if (viewMode === "chronological") {
+      sessions.forEach((session, idx) => {
+        children.push(
+          new Paragraph({
+            children: [
+              new TextRun({
+                text: `Session ${idx + 1} — ${session.start} — ${session.end} (${session.timeline.length} messages)`,
+                bold: true,
+              }),
+            ],
+            heading: HeadingLevel.HEADING_1,
+          })
+        );
+        const sorted = [...session.timeline].sort((a, b) => {
+          const timeCmp = a.time.localeCompare(b.time);
+          return timeCmp !== 0 ? timeCmp : a.id.localeCompare(b.id);
+        });
+        for (const entry of sorted) {
+          children.push(
+            new Paragraph({
+              children: [
+                new TextRun({ text: `[${entry.channel}] `, bold: true }),
+                new TextRun({ text: `${entry.author} `, bold: true }),
+                new TextRun({ text: `(${entry.time}): `, italics: true }),
+                new TextRun(entry.text),
+              ],
+            })
+          );
+        }
+      });
+      return children;
+    }
+    // By-channel with multiple sessions: still per-session heading then by-channel inside each
+    for (const [idx, session] of sessions.entries()) {
+      children.push(
+        new Paragraph({
+          children: [
+            new TextRun({
+              text: `Session ${idx + 1} — ${session.start} — ${session.end}`,
+              bold: true,
+            }),
+          ],
+          heading: HeadingLevel.HEADING_1,
+        })
+      );
+      const byChannel = new Map<string, typeof session.timeline>();
+      for (const entry of session.timeline) {
+        const list = byChannel.get(entry.channel) ?? [];
+        list.push(entry);
+        byChannel.set(entry.channel, list);
+      }
+      for (const [channel, entries] of byChannel) {
+        entries.sort((a, b) => {
+          const timeCmp = a.time.localeCompare(b.time);
+          return timeCmp !== 0 ? timeCmp : a.id.localeCompare(b.id);
+        });
+        children.push(
+          new Paragraph({
+            children: [new TextRun(channel)],
+            heading: HeadingLevel.HEADING_2,
+          })
+        );
+        for (const entry of entries) {
+          children.push(
+            new Paragraph({
+              children: [
+                new TextRun({ text: `${entry.author} `, bold: true }),
+                new TextRun({ text: `(${entry.time}): `, italics: true }),
+                new TextRun(entry.text),
+              ],
+            })
+          );
+        }
+      }
+    }
+    return children;
+  }
+
   if (viewMode === "chronological") {
-    // Merge all session timelines, sort by (time, id)
+    // Merge all session timelines, sort by (time, id) — single session case
     const all = sessions.flatMap((s) => s.timeline);
     all.sort((a, b) => {
       const timeCmp = a.time.localeCompare(b.time);
@@ -569,10 +719,11 @@ function participantIndex(sessions: Session[]): (Paragraph | Table)[] {
 // ---------- buildSections ----------
 
 /**
- * Build the five document sections from resolved sessions.
+ * Build the four document sections from resolved sessions.
  *
- * Returns DocxSection[] in order: [titlePage, metadata, timelineBody,
- * threadSubSections, participantIndex].
+ * Returns DocxSection[] in order: [titleAndMetaCompact, timelineBody,
+ * threadSubSections, participantIndex]. First section merges title+metadata
+ * with spacer (size 32, after:3600). Tail sections use CONTINUOUS.
  */
 export function buildSections(
   sessions: Session[],
@@ -593,18 +744,27 @@ export function buildSections(
   const generatedAt = new Date().toISOString();
 
   return [
-    { children: titlePage(serverName, sessions) },
     {
-      children: metadata(
+      children: titleAndMetaCompact(
+        serverName,
+        sessions,
         generatedAt,
         options.viewMode,
-        filterDesc,
-        sessions.length
+        filterDesc
       ),
     },
-    { children: timelineBody(sessions, options.viewMode) },
-    { children: threadSubSections(sessions) },
-    { children: participantIndex(sessions) },
+    {
+      children: timelineBody(sessions, options.viewMode),
+      properties: { type: SectionType.CONTINUOUS },
+    },
+    {
+      children: threadSubSections(sessions),
+      properties: { type: SectionType.CONTINUOUS },
+    },
+    {
+      children: participantIndex(sessions),
+      properties: { type: SectionType.CONTINUOUS },
+    },
   ];
 }
 
@@ -664,19 +824,24 @@ export async function main(
 
   // Build and write output.
   if (args.output) {
-    // Single explicit --output path: one document containing all filtered sessions.
+    // Single explicit --output path: one document containing all filtered sessions (bypasses grouping).
     const sections = buildSections(resolved, args);
     const doc = new Document({ sections });
     const buffer = await Packer.toBuffer(doc);
     io.mkdirSync(path.dirname(args.output), { recursive: true });
     io.writeFileSync(args.output, buffer);
   } else {
-    // No --output: one DOCX per session, each containing ONLY that session (D1).
-    for (const session of resolved) {
-      const sections = buildSections([session], args);
+    // No --output: daily grouping via groupSessionsByDay (filters before grouping).
+    if (resolved.length === 0) {
+      io.exit(0);
+      return;
+    }
+    const grouped = groupSessionsByDay(resolved, TZ);
+    for (const [day, daySessions] of grouped) {
+      const sections = buildSections(daySessions, args);
       const doc = new Document({ sections });
       const buffer = await Packer.toBuffer(doc);
-      const outPath = computeOutputPath(args, session, output.guildId);
+      const outPath = computeDailyOutputPath(args.serverName, day, output.guildId);
       io.mkdirSync(path.dirname(outPath), { recursive: true });
       io.writeFileSync(outPath, buffer);
     }
