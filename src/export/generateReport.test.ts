@@ -613,19 +613,19 @@ describe("buildSections compact header (1A)", () => {
     assert.ok(firstJson.includes("Generated"), "first section must contain metadata");
   });
 
-  it("title size 32 and spacer spacing.after 3600", () => {
+  it("title size 48 Aptos Display and span after 480 no 3600 (aesthetic refresh)", () => {
     const output = makeOutput();
     const resolved = resolveNames(output.sessions[0], output.users, output.channels);
     const sections = buildSections([resolved], makeOptions());
     const firstJson = JSON.stringify(sections[0].children.map((c: any) => c.root ?? c));
-    // Title size 32: docx TextRun size is serialized as w:sz with val 32
-    assert.ok(firstJson.includes('"val":32') || firstJson.includes('"size":32') || firstJson.includes("32"), "title must be size 32, got json: " + firstJson.slice(0, 500));
-    // Spacer spacing.after 3600
+    assert.ok(firstJson.includes('"val":48') || firstJson.includes('"size":48'), "title must be size 48, got json: " + firstJson.slice(0, 800));
+    assert.ok(firstJson.includes("Aptos Display"), "title must be Aptos Display");
+    assert.ok(firstJson.includes("480"), "span must have after 480");
     const hasSpacer = sections[0].children.some((c: any) => {
       const j = JSON.stringify(c.root ?? c);
       return j.includes("3600");
     });
-    assert.ok(hasSpacer, "first section must contain spacer with spacing.after 3600");
+    assert.ok(!hasSpacer, "must NOT contain spacer 3600, got spacer");
   });
 
   it("tail sections are CONTINUOUS", () => {
@@ -1408,5 +1408,126 @@ describe("RED Bug1 Placeholder boundaries >5MB/len=0/!isKnownImageMagic (2.3)", 
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  });
+});
+
+// ---------- RED docx-aesthetic-refresh PR1: Intl helpers + header (Strict TDD) ----------
+
+describe("RED docx-aesthetic-refresh PR1: Intl helpers SP (1.1)", () => {
+  it("formatSpan long 19 de outubro 15:44 — 20 de outubro 02:45 SP no seconds", async () => {
+    const { formatSpan } = await import("./generateReport");
+    assert.equal(
+      formatSpan("2023-10-19T18:44:28Z", "2023-10-20T05:45:59Z"),
+      "19 de outubro de 2023, 15:44 — 20 de outubro de 2023, 02:45"
+    );
+  });
+
+  it("formatMessageTime short 19/10/2023 15:01 SP no seconds/comma", async () => {
+    const { formatMessageTime } = await import("./generateReport");
+    assert.equal(formatMessageTime("2023-10-19T18:01:00Z"), "19/10/2023 15:01");
+  });
+
+  it("formatFooterTime ends -03:00 not Z and contains pt-BR short month", async () => {
+    const { formatFooterTime } = await import("./generateReport");
+    const d = new Date("2026-08-23T20:14:54.095Z");
+    const out = formatFooterTime(d);
+    assert.match(out, / -03:00$/);
+    assert.ok(!out.includes("Z"), "must not contain Z");
+    assert.ok(!out.includes("T"), "must not contain T");
+    assert.match(out, /23 ago\. 2026, 17:14 -03:00/);
+  });
+
+  it("TZ conversion edge 15:44Z → 12:44 SP", async () => {
+    const { formatMessageTime, formatSpan } = await import("./generateReport");
+    assert.equal(formatMessageTime("2023-10-19T15:44:28Z"), "19/10/2023 12:44");
+    assert.ok(formatSpan("2023-10-19T15:44:28Z", "2023-10-19T16:44:28Z").includes("12:44"));
+    assert.ok(!formatSpan("2023-10-19T15:44:28Z", "2023-10-19T16:44:28Z").includes("15:44"));
+  });
+
+  it("invalid throws for formatSpan/formatMessageTime", async () => {
+    const { formatSpan, formatMessageTime } = await import("./generateReport");
+    assert.throws(() => formatSpan("not-a-date", "2023-10-20T05:45:59Z"), /invalid date/i);
+    assert.throws(() => formatMessageTime("bad-iso"), /invalid date/i);
+    assert.throws(() => formatSpan("2023-10-19T18:44:28Z", "invalid"), /invalid date/i);
+  });
+
+  it("helpers must NOT include seconds/millis/T/Z/UTC", async () => {
+    const { formatSpan, formatMessageTime, formatFooterTime } = await import("./generateReport");
+    const span = formatSpan("2023-10-19T18:44:28.528Z", "2023-10-20T05:45:59.060Z");
+    const msg = formatMessageTime("2023-10-19T18:44:28.528Z");
+    const footer = formatFooterTime(new Date("2023-10-19T18:44:28.528Z"));
+    for (const s of [span, msg]) {
+      assert.ok(!s.includes("528"), "no millis");
+      assert.ok(!s.includes("28.528"), "no seconds millis");
+      assert.ok(!s.includes("T"), "no T");
+      // footer has -03:00 but span/msg must not have Z or UTC
+      assert.ok(!s.includes("Z"), "no Z");
+      assert.ok(!s.includes("UTC"), "no UTC");
+    }
+    // footer must not contain Z/T either, only -03:00
+    assert.ok(!footer.includes("Z"));
+    assert.match(footer, / -03:00$/);
+    // seconds check: should be HH:mm only, no :28
+    assert.ok(!/\d{2}:\d{2}:\d{2}/.test(span), "span no seconds");
+    assert.ok(!/\d{2}:\d{2}:\d{2}/.test(msg), "msg no seconds");
+  });
+});
+
+describe("RED docx-aesthetic-refresh PR1: header title/span/metadata (2.1)", () => {
+  it("title sz48 Aptos Display bold CENTER and span sz24 Aptos CENTER after:480", () => {
+    const { buildSections } = require("./generateReport");
+    const output = makeOutput();
+    const resolved = resolveNames(output.sessions[0], output.users, output.channels);
+    const sections = buildSections([resolved], makeOptions({ serverName: "JogoHoje" }));
+    const firstChildren = sections[0].children;
+    const jsons = firstChildren.map((c: any) => JSON.stringify(c.root ?? c));
+    const allJson = jsons.join("\n");
+    // title: first para should contain JogoHoje, 48, Aptos Display, bold, jc center
+    assert.ok(allJson.includes("JogoHoje"), "title must contain server name");
+    assert.ok(allJson.includes("48"), "title sz 48 (half-pt) must be present");
+    assert.ok(allJson.includes("Aptos Display"), "title font Aptos Display");
+    // center alignment
+    assert.ok(allJson.includes("center") || allJson.includes("CENTER"), "title and span must be center");
+    // span: second para should be date range SP long, sz 24, Aptos, after 480
+    const spanJson = jsons[1] ?? "";
+    assert.ok(spanJson.includes("24") || allJson.includes("24"), "span sz 24 present");
+    assert.ok(allJson.includes("Aptos"), "Aptos font present");
+    assert.ok(allJson.includes("480"), "span spacing after 480 must exist");
+    // ensure after 480 is in span para, not just anywhere
+    assert.ok(spanJson.includes("480"), "span para must have after 480");
+  });
+
+  it("4× metadata RIGHT sz18 Aptos last after:360 no 3600 spacer footer -03:00", () => {
+    const { buildSections } = require("./generateReport");
+    const output = makeOutput();
+    const resolved = resolveNames(output.sessions[0], output.users, output.channels);
+    const sections = buildSections([resolved], makeOptions({ serverName: "JogoHoje" }));
+    const firstChildren = sections[0].children;
+    const jsons = firstChildren.map((c: any) => JSON.stringify(c.root ?? c));
+    const allJson = jsons.join("\n");
+    // No 3600 anywhere
+    assert.ok(!allJson.includes("3600"), "must not contain spacer 3600, got: " + allJson.slice(0, 2000));
+    // 4 metadata paras each RIGHT sz18 Aptos — check at least 4 occurrences of right
+    const rightCount = (allJson.match(/right/gi) || []).length;
+    assert.ok(rightCount >= 4, `need >=4 right alignments, got ${rightCount}`);
+    assert.ok(allJson.includes("18"), "metadata sz 18 present");
+    // last meta after 360
+    const lastMetaJson = jsons[jsons.length - 1] ?? "";
+    // Check that at least one para has after 360
+    assert.ok(allJson.includes("360"), "after 360 must exist for last meta");
+    // footer -03:00 in generated
+    assert.match(allJson, /-03:00/);
+    assert.ok(!allJson.match(/Generated:[^]*Z"/) || allJson.includes("-03:00"), "generated must not have Z, must have -03:00");
+    // ensure header has 6 children? Title + span + 4 metas =6, no spacer
+    assert.equal(firstChildren.length, 6, "titleAndMetaCompact must be 6 paras (title, span, 4 metas) no spacer, got " + firstChildren.length);
+  });
+
+  it("empty sessions still title 48 no spacer 4 sections", () => {
+    const { buildSections } = require("./generateReport");
+    const sections = buildSections([], makeOptions({ serverName: "Empty" }));
+    assert.equal(sections.length, 4);
+    const firstJson = JSON.stringify(sections[0].children.map((c: any) => c.root ?? c));
+    assert.ok(!firstJson.includes("3600"), "empty must not have 3600");
+    assert.ok(firstJson.includes("48"), "empty title still 48");
   });
 });

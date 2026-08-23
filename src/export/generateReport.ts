@@ -163,6 +163,60 @@ export const tryEmbedImages = (
 
 export const TZ = "America/Sao_Paulo" as const;
 
+const SPAN_OPTS: Intl.DateTimeFormatOptions = {
+  timeZone: TZ,
+  day: "numeric",
+  month: "long",
+  year: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+};
+
+const MSG_OPTS: Intl.DateTimeFormatOptions = {
+  timeZone: TZ,
+  day: "2-digit",
+  month: "2-digit",
+  year: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+};
+
+const FOOTER_OPTS: Intl.DateTimeFormatOptions = {
+  timeZone: TZ,
+  day: "2-digit",
+  month: "short",
+  year: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+};
+
+export function formatSpan(s: string, e: string): string {
+  const d1 = new Date(s);
+  if (Number.isNaN(d1.getTime())) throw new Error(`invalid date: ${s}`);
+  const d2 = new Date(e);
+  if (Number.isNaN(d2.getTime())) throw new Error(`invalid date: ${e}`);
+  const fmt = new Intl.DateTimeFormat("pt-BR", SPAN_OPTS);
+  const a = fmt.format(d1).replace(" às ", ", ");
+  const b = fmt.format(d2).replace(" às ", ", ");
+  return `${a} — ${b}`;
+}
+
+export function formatMessageTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) throw new Error(`invalid date: ${iso}`);
+  const fmt = new Intl.DateTimeFormat("pt-BR", MSG_OPTS);
+  return fmt.format(d).replace(", ", " ");
+}
+
+export function formatFooterTime(d: Date): string {
+  if (Number.isNaN(d.getTime())) throw new Error(`invalid date: ${String(d)}`);
+  const fmt = new Intl.DateTimeFormat("pt-BR", FOOTER_OPTS);
+  const base = fmt.format(d).replace(/ de /g, " ");
+  return `${base} -03:00`;
+}
+
 export function formatDay(isoTime: string, timeZone: string): string {
   const d = new Date(isoTime);
   if (Number.isNaN(d.getTime())) throw new Error(`invalid date: ${isoTime}`);
@@ -469,7 +523,7 @@ function formatSlug(isoTime: string): string {
 
 /**
  * Title page: server name + session span (first → last message time).
- * Size 32 for compact header (was 48).
+ * Title 48 Aptos Display bold CENTER, span Aptos 24 CENTER after 480.
  */
 function titlePage(
   serverName: string,
@@ -479,7 +533,14 @@ function titlePage(
 
   children.push(
     new Paragraph({
-      children: [new TextRun({ text: serverName, bold: true, size: 32 })],
+      children: [
+        new TextRun({
+          text: serverName,
+          bold: true,
+          size: 48,
+          font: "Aptos Display",
+        }),
+      ],
       heading: HeadingLevel.TITLE,
       alignment: AlignmentType.CENTER,
     })
@@ -488,21 +549,33 @@ function titlePage(
   if (sessions.length > 0) {
     const first = sessions[0].start;
     const last = sessions[sessions.length - 1].end;
-    const spanText =
-      sessions.length === 1
-        ? `${first} — ${last}`
-        : `${sessions.length} sessions: ${first} — ${last}`;
+    let spanText: string;
+    if (sessions.length === 1) {
+      try {
+        spanText = formatSpan(first, last);
+      } catch {
+        spanText = `${first} — ${last}`;
+      }
+    } else {
+      try {
+        spanText = `${sessions.length} sessions: ${formatSpan(first, last)}`;
+      } catch {
+        spanText = `${sessions.length} sessions: ${first} — ${last}`;
+      }
+    }
     children.push(
       new Paragraph({
-        children: [new TextRun({ text: spanText, size: 24 })],
+        children: [new TextRun({ text: spanText, size: 24, font: "Aptos" })],
         alignment: AlignmentType.CENTER,
+        spacing: { after: 480 },
       })
     );
   } else {
     children.push(
       new Paragraph({
-        children: [new TextRun({ text: "No sessions", size: 24 })],
+        children: [new TextRun({ text: "No sessions", size: 24, font: "Aptos" })],
         alignment: AlignmentType.CENTER,
+        spacing: { after: 480 },
       })
     );
   }
@@ -512,6 +585,7 @@ function titlePage(
 
 /**
  * Metadata: generated-at, view mode, filter description, session count.
+ * 4× RIGHT Aptos 18, last after 360, footer -03:00 handled by formatFooterTime.
  */
 function metadata(
   generatedAt: string,
@@ -522,34 +596,39 @@ function metadata(
   return [
     new Paragraph({
       children: [
-        new TextRun({ text: "Generated: ", bold: true }),
-        new TextRun(generatedAt),
+        new TextRun({ text: "Generated: ", bold: true, font: "Aptos", size: 18 }),
+        new TextRun({ text: generatedAt, font: "Aptos", size: 18 }),
       ],
+      alignment: AlignmentType.RIGHT,
     }),
     new Paragraph({
       children: [
-        new TextRun({ text: "View: ", bold: true }),
-        new TextRun(viewMode),
+        new TextRun({ text: "View: ", bold: true, font: "Aptos", size: 18 }),
+        new TextRun({ text: viewMode, font: "Aptos", size: 18 }),
       ],
+      alignment: AlignmentType.RIGHT,
     }),
     new Paragraph({
       children: [
-        new TextRun({ text: "Filter: ", bold: true }),
-        new TextRun(filterDesc || "none"),
+        new TextRun({ text: "Filter: ", bold: true, font: "Aptos", size: 18 }),
+        new TextRun({ text: filterDesc || "none", font: "Aptos", size: 18 }),
       ],
+      alignment: AlignmentType.RIGHT,
     }),
     new Paragraph({
       children: [
-        new TextRun({ text: "Sessions: ", bold: true }),
-        new TextRun(String(sessionCount)),
+        new TextRun({ text: "Sessions: ", bold: true, font: "Aptos", size: 18 }),
+        new TextRun({ text: String(sessionCount), font: "Aptos", size: 18 }),
       ],
+      alignment: AlignmentType.RIGHT,
+      spacing: { after: 360 },
     }),
   ];
 }
 
 /**
- * Merged compact header: title (32) + span + spacer (after:3600) + metadata.
- * Spacer is an empty paragraph with spacing.after 3600 (~6.3cm, ~50% page).
+ * Merged compact header: title (48 Aptos Display) + span (24 Aptos after:480) + metadata (RIGHT 18 last 360).
+ * Spacer after:3600 removed.
  */
 function titleAndMetaCompact(
   serverName: string,
@@ -559,17 +638,13 @@ function titleAndMetaCompact(
   filterDesc: string
 ): (Paragraph | Table)[] {
   const titleChildren = titlePage(serverName, sessions);
-  const spacer = new Paragraph({
-    children: [],
-    spacing: { after: 3600 },
-  });
   const metaChildren = metadata(
     generatedAt,
     viewMode,
     filterDesc,
     sessions.length
   );
-  return [...titleChildren, spacer, ...metaChildren];
+  return [...titleChildren, ...metaChildren];
 }
 
 /**
@@ -861,7 +936,7 @@ export function buildSections(
     filterParts.push(`session=${options.sessionIndex}`);
   const filterDesc = filterParts.join("; ");
 
-  const generatedAt = new Date().toISOString();
+  const generatedAt = formatFooterTime(new Date());
 
   return [
     {
