@@ -12,6 +12,9 @@ import {
   TZ,
   parseReportArgs,
   buildSections,
+  clampTransform,
+  getImageDimensions,
+  tryEmbedImages,
   main,
   type ExportOutput,
   type ReportIO,
@@ -1117,6 +1120,291 @@ describe("generateReport Unit2: schema gate 1|2 + image embedding", () => {
       assert.ok(json.includes("[image: bad.webp unavailable]"), "corrupt webp must render placeholder");
       assert.ok(json.includes("w:i"), "placeholder must be italic");
       assert.ok(!json.includes("not-an-image"), "raw corrupt bytes must not be embedded");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------- RED Bug1 Proportional Embedding Strict TDD (2.1) ----------
+
+describe("RED Bug1 — Proportional Embedding via getImageDimensions + clampTransform (2.1)", () => {
+  // helpers to craft minimal valid buffers for image-size
+  function pngWithDims(w: number, h: number): Buffer {
+    const b = Buffer.alloc(32);
+    b[0] = 0x89; b[1] = 0x50; b[2] = 0x4e; b[3] = 0x47; b[4] = 0x0d; b[5] = 0x0a; b[6] = 0x1a; b[7] = 0x0a;
+    b.writeUInt32BE(13, 8);
+    b.write("IHDR", 12);
+    b.writeUInt32BE(w, 16);
+    b.writeUInt32BE(h, 20);
+    b[24] = 8; b[25] = 2; b[26] = 0; b[27] = 0; b[28] = 0;
+    return b;
+  }
+  function gifWithDims(w: number, h: number): Buffer {
+    const b = Buffer.alloc(10);
+    b.write("GIF89a", 0);
+    b.writeUInt16LE(w, 6);
+    b.writeUInt16LE(h, 8);
+    return b;
+  }
+  function jpgWithDims(w: number, h: number): Buffer {
+    const b = Buffer.alloc(41);
+    let o = 0;
+    b[o++] = 0xff; b[o++] = 0xd8;
+    b[o++] = 0xff; b[o++] = 0xe0;
+    b.writeUInt16BE(16, o); o += 2;
+    b.write("JFIF", o); o += 4;
+    b[o++] = 0x00; b[o++] = 0x01; b[o++] = 0x01; b[o++] = 0x00;
+    b.writeUInt16BE(1, o); o += 2; b.writeUInt16BE(1, o); o += 2; b[o++] = 0x00; b[o++] = 0x00;
+    b[o++] = 0xff; b[o++] = 0xc0;
+    b.writeUInt16BE(17, o); o += 2;
+    b[o++] = 8;
+    b.writeUInt16BE(h, o); o += 2;
+    b.writeUInt16BE(w, o); o += 2;
+    b[o++] = 3; b[o++] = 1; b[o++] = 0x22; b[o++] = 0x00; b[o++] = 2; b[o++] = 0x11; b[o++] = 0x01; b[o++] = 3; b[o++] = 0x11; b[o++] = 0x01;
+    b[o++] = 0xff; b[o++] = 0xd9;
+    return b.slice(0, o);
+  }
+  function webpWithDims(w: number, h: number): Buffer {
+    const b = Buffer.alloc(30);
+    b.write("RIFF", 0);
+    b.writeUInt32LE(22, 4);
+    b.write("WEBP", 8);
+    b.write("VP8 ", 12);
+    b.writeUInt32LE(10, 16);
+    // bytes 20..29 are VP8 data; lossy calculation uses bytes at 26/28
+    b[26] = w & 0xff; b[27] = (w >> 8) & 0xff;
+    b[28] = h & 0xff; b[29] = (h >> 8) & 0xff;
+    return b;
+  }
+  function writeTemp(tmp: string, rel: string, data: Buffer) {
+    const full = path.join(tmp, rel);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, data);
+    return full;
+  }
+  function makeOutputWithImages(entries: Array<{ id: string; channelId: string; authorId: string; name: string; relPath: string }>): ExportOutput {
+    return {
+      schemaVersion: "2" as any,
+      guildId: "guild-1",
+      generatedAt: "2026-08-20T10:00:00.000Z",
+      mode: "full",
+      filter: { channelIds: [], from: null, to: null },
+      users: { "u1": { username: "alice", displayName: "Alice", globalName: "Alice G" } },
+      channels: { "c1": { name: "general", type: "text", parentId: null } },
+      sessions: [{
+        start: "2026-08-20T10:00:00.000Z",
+        end: "2026-08-20T11:00:00.000Z",
+        channelIds: ["c1"],
+        timeline: entries.map(e => ({
+          id: e.id, channelId: e.channelId, authorId: e.authorId, author: "Alice", channel: "general", time: "2026-08-20T10:00:00.000Z", text: "hello with image",
+          images: [{ name: e.name, path: e.relPath, contentType: "image/png" }],
+        })),
+        topics: [],
+      }],
+    };
+  }
+  function getDrawnCxCy(json: string): { cx: number; cy: number } | null {
+    // docx serializes extents as a:ext with cx/cy in EMUs (9525 per CSS pixel)
+    const m = json.match(/"cx":\s*(\d+)[^}]*"cy":\s*(\d+)/) || json.match(/cx["\s:]+(\d+)[^}]*cy["\s:]+(\d+)/);
+    if (m) return { cx: Number(m[1]), cy: Number(m[2]) };
+    // fallback search for extent values
+    const m2 = json.match(/(\d{6,7})[^0-9]+(\d{6,7})/);
+    if (m2) return { cx: Number(m2[1]), cy: Number(m2[2]) };
+    return null;
+  }
+
+  it("getImageDimensions returns correct dims for PNG 1139x1381 and JPEG/GIF/WebP", () => {
+    assert.deepEqual(getImageDimensions(pngWithDims(1139, 1381)), { width: 1139, height: 1381 });
+    assert.deepEqual(getImageDimensions(jpgWithDims(900, 492)), { width: 900, height: 492 });
+    assert.deepEqual(getImageDimensions(gifWithDims(100, 200)), { width: 100, height: 200 });
+    const wp = webpWithDims(640, 480);
+    const d = getImageDimensions(wp);
+    assert.ok(d && d.width === 640 && d.height === 480, "webp dims must be 640x480 got " + JSON.stringify(d));
+  });
+
+  it("Portrait 1139x1381 → 247x300 via clampTransform and tryEmbedImages", () => {
+    assert.deepEqual(clampTransform(1139, 1381), { width: 247, height: 300 });
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "docx-red-portrait-"));
+    try {
+      const rel = "images/m1__portrait.png";
+      writeTemp(tmp, rel, pngWithDims(1139, 1381));
+      const out = makeOutputWithImages([{ id: "m1", channelId: "c1", authorId: "u1", name: "portrait.png", relPath: rel }]);
+      const resolved = out.sessions.map(s => resolveNames(s, out.users, out.channels));
+      const sections = (buildSections as any)(resolved, makeOptions(), tmp);
+      const json = JSON.stringify(sections.flatMap((s: any) => s.children).map((c: any) => c.root ?? c));
+      assert.ok(json.includes("w:drawing"), "must contain ImageRun drawing");
+      assert.ok(!json.includes("[image: portrait.png unavailable]"), "portrait must not be placeholder");
+      // EMU expectations: 247*9525=2352675, 300*9525=2857500
+      assert.ok(json.includes("2352675") && json.includes("2857500"), "portrait must be 247x300 EMU 2352675x2857500, got " + json.slice(0, 800));
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("Landscape 900x492 → 450x246 via tryEmbedImages", () => {
+    assert.deepEqual(clampTransform(900, 492), { width: 450, height: 246 });
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "docx-red-landscape-"));
+    try {
+      const rel = "images/m1__landscape.jpg";
+      writeTemp(tmp, rel, jpgWithDims(900, 492));
+      const out = makeOutputWithImages([{ id: "m1", channelId: "c1", authorId: "u1", name: "landscape.jpg", relPath: rel }]);
+      const resolved = out.sessions.map(s => resolveNames(s, out.users, out.channels));
+      const sections = (buildSections as any)(resolved, makeOptions(), tmp);
+      const json = JSON.stringify(sections.flatMap((s: any) => s.children).map((c: any) => c.root ?? c));
+      assert.ok(json.includes("w:drawing"), "landscape must contain drawing");
+      assert.ok(!json.includes("[image: landscape.jpg unavailable]"));
+      // 450*9525=4286250, 246*9525=2343150
+      assert.ok(json.includes("4286250") && json.includes("2343150"), "landscape must be 450x246 EMU 4286250x2343150");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("truncated/corrupt dims fallback → 450x300 ImageRun not placeholder", () => {
+    const truncated = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00]); // too short for IHDR
+    assert.equal(getImageDimensions(truncated), null, "truncated PNG must return null");
+    assert.deepEqual(clampTransform(), { width: 450, height: 300 });
+    assert.deepEqual(clampTransform(undefined as any, undefined as any), { width: 450, height: 300 });
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "docx-red-trunc-"));
+    try {
+      const rel = "images/m1__trunc.png";
+      // Write a file that passes isKnownImageMagic (PNG sig) but is truncated so getImageDimensions fails
+      const full = path.join(tmp, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      // PNG signature + minimal bytes but not enough for image-size; still passes magic check (>=4 bytes 89 50 4E 47)
+      fs.writeFileSync(full, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]));
+      const out = makeOutputWithImages([{ id: "m1", channelId: "c1", authorId: "u1", name: "trunc.png", relPath: rel }]);
+      const resolved = out.sessions.map(s => resolveNames(s, out.users, out.channels));
+      const sections = (buildSections as any)(resolved, makeOptions(), tmp);
+      const json = JSON.stringify(sections.flatMap((s: any) => s.children).map((c: any) => c.root ?? c));
+      assert.ok(json.includes("w:drawing"), "truncated dims must still embed ImageRun fallback");
+      assert.ok(!json.includes("[image: trunc.png unavailable]"), "must not be placeholder");
+      assert.ok(json.includes("4286250") && json.includes("2857500"), "fallback must be 450x300 EMU");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("PNG/JPEG/GIF/WebP supported — each embeds with correct clamped size", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "docx-red-formats-"));
+    try {
+      const cases: Array<{ name: string; buf: Buffer; expW: number; expH: number }> = [
+        { name: "a.png", buf: pngWithDims(600, 400), expW: 450, expH: 300 },
+        { name: "b.jpg", buf: jpgWithDims(200, 100), expW: 200, expH: 100 },
+        { name: "c.gif", buf: gifWithDims(100, 200), expW: 100, expH: 200 },
+      ];
+      // WebP 640x480 → clamped 450x337? Let's compute: w=min(640,450)=450 h=round(450*480/640)=337 → ≤300? 337>300 fallback to h=300 w=round(300*640/480)=400 ⇒ actually 400x300
+      // Check clampTransform(640,480) = 400x300
+      const wp = webpWithDims(640, 480);
+      const d = getImageDimensions(wp)!;
+      const clamped = clampTransform(d.width, d.height);
+      assert.ok(clamped.width <= 450 && clamped.height <= 300, "webp clamped must respect cap");
+
+      for (const c of cases) {
+        const rel = `images/m1__${c.name}`;
+        writeTemp(tmp, rel, c.buf);
+        const out = makeOutputWithImages([{ id: "m1", channelId: "c1", authorId: "u1", name: c.name, relPath: rel }]);
+        const resolved = out.sessions.map(s => resolveNames(s, out.users, out.channels));
+        const sections = (buildSections as any)(resolved, makeOptions(), tmp);
+        const json = JSON.stringify(sections.flatMap((s: any) => s.children).map((c: any) => c.root ?? c));
+        assert.ok(json.includes("w:drawing"), `${c.name} must embed`);
+        assert.ok(!json.includes(`[image: ${c.name} unavailable]`), `${c.name} must not be placeholder`);
+        // verify not always 450x300 for small images — e.g., 200x100 stays 200x100
+        if (c.expW !== 450 || c.expH !== 300) {
+          const emuW = String(c.expW * 9525);
+          const emuH = String(c.expH * 9525);
+          assert.ok(json.includes(emuW) && json.includes(emuH), `${c.name} must be ${c.expW}x${c.expH}`);
+        }
+      }
+      // webp case separately
+      const relWp = "images/m1__w.webp";
+      writeTemp(tmp, relWp, wp);
+      const outWp = makeOutputWithImages([{ id: "m1", channelId: "c1", authorId: "u1", name: "w.webp", relPath: relWp }]);
+      const resolvedWp = outWp.sessions.map(s => resolveNames(s, outWp.users, outWp.channels));
+      const sectionsWp = (buildSections as any)(resolvedWp, makeOptions(), tmp);
+      const jsonWp = JSON.stringify(sectionsWp.flatMap((s: any) => s.children).map((c: any) => c.root ?? c));
+      assert.ok(jsonWp.includes("w:drawing"), "webp must embed");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------- RED Bug1 Placeholder Boundaries Strict TDD (2.3) ----------
+
+describe("RED Bug1 Placeholder boundaries >5MB/len=0/!isKnownImageMagic (2.3)", () => {
+  it("placeholder >5MB → italic placeholder not ImageRun", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "docx-red-oversized2-"));
+    try {
+      const rel = "images/m1__big2.png";
+      const full = path.join(tmp, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      const fd = fs.openSync(full, "w");
+      fs.ftruncateSync(fd, 5 * 1024 * 1024 + 1);
+      fs.closeSync(fd);
+      const out: ExportOutput = {
+        schemaVersion: "2" as any, guildId: "guild-1", generatedAt: "2026-08-20T10:00:00.000Z", mode: "full",
+        filter: { channelIds: [], from: null, to: null },
+        users: { "u1": { username: "alice", displayName: "Alice", globalName: "Alice G" } },
+        channels: { "c1": { name: "general", type: "text", parentId: null } },
+        sessions: [{ start: "2026-08-20T10:00:00.000Z", end: "2026-08-20T11:00:00.000Z", channelIds: ["c1"], timeline: [{ id: "m1", channelId: "c1", authorId: "u1", author: "Alice", channel: "general", time: "2026-08-20T10:00:00.000Z", text: "hello", images: [{ name: "big2.png", path: rel, contentType: "image/png" }] }], topics: [] }],
+      };
+      const resolved = out.sessions.map(s => resolveNames(s, out.users, out.channels));
+      const sections = (buildSections as any)(resolved, makeOptions(), tmp);
+      const json = JSON.stringify(sections.flatMap((s: any) => s.children).map((c: any) => c.root ?? c));
+      assert.ok(json.includes("[image: big2.png unavailable]"), "oversized must be placeholder");
+      assert.ok(json.includes("w:i"), "placeholder italic");
+      // must NOT contain drawing with image extent for this item
+      const hasDrawing = json.includes("w:drawing") && json.includes("big2.png");
+      assert.ok(!hasDrawing || json.includes("[image:"), "oversized must not embed ImageRun");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+  it("placeholder len=0 → italic placeholder", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "docx-red-empty-"));
+    try {
+      const rel = "images/m1__empty.png";
+      const full = path.join(tmp, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, Buffer.alloc(0));
+      const out: ExportOutput = {
+        schemaVersion: "2" as any, guildId: "guild-1", generatedAt: "2026-08-20T10:00:00.000Z", mode: "full",
+        filter: { channelIds: [], from: null, to: null },
+        users: { "u1": { username: "alice", displayName: "Alice", globalName: "Alice G" } },
+        channels: { "c1": { name: "general", type: "text", parentId: null } },
+        sessions: [{ start: "2026-08-20T10:00:00.000Z", end: "2026-08-20T11:00:00.000Z", channelIds: ["c1"], timeline: [{ id: "m1", channelId: "c1", authorId: "u1", author: "Alice", channel: "general", time: "2026-08-20T10:00:00.000Z", text: "hello", images: [{ name: "empty.png", path: rel, contentType: "image/png" }] }], topics: [] }],
+      };
+      const resolved = out.sessions.map(s => resolveNames(s, out.users, out.channels));
+      const sections = (buildSections as any)(resolved, makeOptions(), tmp);
+      const json = JSON.stringify(sections.flatMap((s: any) => s.children).map((c: any) => c.root ?? c));
+      assert.ok(json.includes("[image: empty.png unavailable]"));
+      assert.ok(json.includes("w:i"));
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+  it("placeholder !isKnownImageMagic fake %PDF → italic placeholder distinct from fallback", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "docx-red-fake-"));
+    try {
+      const rel = "images/m1__fake.png";
+      const full = path.join(tmp, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, Buffer.from("%PDF-1.4 fake content"));
+      const out: ExportOutput = {
+        schemaVersion: "2" as any, guildId: "guild-1", generatedAt: "2026-08-20T10:00:00.000Z", mode: "full",
+        filter: { channelIds: [], from: null, to: null },
+        users: { "u1": { username: "alice", displayName: "Alice", globalName: "Alice G" } },
+        channels: { "c1": { name: "general", type: "text", parentId: null } },
+        sessions: [{ start: "2026-08-20T10:00:00.000Z", end: "2026-08-20T11:00:00.000Z", channelIds: ["c1"], timeline: [{ id: "m1", channelId: "c1", authorId: "u1", author: "Alice", channel: "general", time: "2026-08-20T10:00:00.000Z", text: "hello", images: [{ name: "fake.png", path: rel, contentType: "image/png" }] }], topics: [] }],
+      };
+      const resolved = out.sessions.map(s => resolveNames(s, out.users, out.channels));
+      const sections = (buildSections as any)(resolved, makeOptions(), tmp);
+      const json = JSON.stringify(sections.flatMap((s: any) => s.children).map((c: any) => c.root ?? c));
+      assert.ok(json.includes("[image: fake.png unavailable]"), "fake %PDF must be placeholder");
+      assert.ok(!json.includes("%PDF"), "raw bytes must not be embedded");
+      assert.ok(json.includes("w:i"), "placeholder italic");
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

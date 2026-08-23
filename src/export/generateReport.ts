@@ -24,9 +24,26 @@ import {
   type ISectionPropertiesOptions,
 } from "docx";
 import { ExportOutput, Session } from "./exportMessages";
+import imageSizeImport from "image-size";
 
 // Re-export for consumers
 export type { ExportOutput, Session } from "./exportMessages";
+
+// ---------- image dimensions wrapper (image-size@^1.1.1, CJS) ----------
+
+const imageSizeFn: (buf: Buffer) => { width?: number; height?: number; type?: string } =
+  (imageSizeImport as unknown as { default?: typeof imageSizeImport }).default ?? (imageSizeImport as unknown as typeof imageSizeImport);
+
+/** Return {width,height} for PNG/JPEG/GIF/WebP buffers, or null on corrupt/truncated. */
+export const getImageDimensions = (buf: Buffer): { width: number; height: number } | null => {
+  try {
+    const s = imageSizeFn(buf);
+    if (s.width == null || s.height == null || s.width <= 0 || s.height <= 0) return null;
+    return { width: s.width, height: s.height };
+  } catch {
+    return null;
+  }
+};
 
 // ---------- types ----------
 
@@ -120,7 +137,8 @@ export const tryEmbedImages = (
       if (!isKnownImageMagic(data)) throw new Error("corrupt or unsupported");
       const ext = path.extname(img.name).replace(/^\./, "").toLowerCase();
       const type = mimeToDocxType(ext);
-      const { width, height } = clampTransform();
+      const dims = getImageDimensions(data);
+      const { width, height } = dims ? clampTransform(dims.width, dims.height) : clampTransform();
       const run = new ImageRun({
         data,
         transformation: { width, height },
