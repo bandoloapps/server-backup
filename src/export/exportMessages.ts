@@ -56,6 +56,7 @@ export interface ExportInput {
     messages: DecryptedMessageRecord[];
     users: UserRecord[];
     channels: ChannelRecord[];
+    attachmentIds?: Set<string>;
 }
 
 export interface ExportOptions {
@@ -237,6 +238,15 @@ export const sniffMagic = (buf: Buffer, ext: string): boolean => {
     return false;
 };
 
+export const inferImageExt = (buf: Buffer): string | null => {
+    if (!buf || buf.length < 2) return null;
+    if (buf.length >= 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "png";
+    if (buf[0] === 0xff && buf[1] === 0xd8) return "jpg";
+    if (buf.length >= 3 && buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return "gif";
+    if (buf.length >= 12 && buf.subarray(0, 4).toString() === "RIFF" && buf.subarray(8, 12).toString() === "WEBP") return "webp";
+    return null;
+};
+
 export const sanitizeName = (name: string): string => name.replace(/[^a-zA-Z0-9._-]/g, "_");
 
 /** Truncate `${messageId}__${sanitized}` to `maxBase` (default 200) preserving ext and prefix + hash for uniqueness. */
@@ -368,10 +378,11 @@ export const buildExport = (input: ExportInput, options: ExportOptions): ExportR
     const fromMs = options.from != null ? parseIso(options.from, "--from") : null;
     const toMs = options.to != null ? parseIso(options.to, "--to") : null;
 
-    // filter + empty-text skip + name resolution (B1.4, B1.5)
+    // filter + empty-text skip except image-only (fix-docx-image-pipeline Bug2)
+    const attachmentIds = input.attachmentIds ?? new Set<string>();
     const entries: InternalEntry[] = [];
     for (const m of input.messages) {
-        if (m.text.trim().length === 0) continue; // empty/whitespace-only skipped
+        if (m.text.trim().length === 0 && !attachmentIds.has(m.messageId)) continue; // empty/whitespace-only skipped unless image-only
         if (channelFilter.size > 0 && !channelFilter.has(m.channelId)) continue;
         if (fromMs != null && m.time < fromMs) continue;
         if (toMs != null && m.time > toMs) continue;
@@ -661,7 +672,6 @@ export const decryptAndMaterializeImages = (
     for (const att of attachments) {
         if (!att.messageId || !att.name) continue;
         if (!emittedIds.has(att.messageId)) continue;
-        if (!isAllowedExt(att.name)) continue;
         let raw: Buffer;
         try {
             if (att.data == null) continue;
@@ -672,13 +682,38 @@ export const decryptAndMaterializeImages = (
             continue;
         }
         if (errors.length > 0) continue;
-        const ext = att.name.slice(att.name.lastIndexOf(".") + 1);
-        if (!sniffMagic(raw, ext)) continue;
-        const sanitized = sanitizeName(att.name);
+        const dot = att.name.lastIndexOf(".");
+        const declaredExt = dot >= 0 && dot < att.name.length - 1 ? att.name.slice(dot + 1) : "";
+        let effectiveExt = declaredExt;
+        let needsRescue = !isAllowedExt(att.name) || !sniffMagic(raw, declaredExt);
+        if (needsRescue) {
+            const inferred = inferImageExt(raw);
+            if (!inferred || !sniffMagic(raw, inferred)) continue;
+            effectiveExt = inferred;
+        } else {
+            // allowed and magic matches — keep declared ext as-is
+            effectiveExt = declaredExt;
+            if (!sniffMagic(raw, effectiveExt)) continue;
+        }
+        // sanitize then rewrite ext to effectiveExt, then truncate
+        const sanitizedRaw = sanitizeName(att.name);
+        let sanitized: string;
+        if (effectiveExt !== declaredExt) {
+            const sDot = sanitizedRaw.lastIndexOf(".");
+            if (sDot >= 0 && sDot < sanitizedRaw.length - 1) {
+                sanitized = sanitizedRaw.slice(0, sDot + 1) + effectiveExt;
+            } else if (sDot === sanitizedRaw.length - 1) {
+                sanitized = sanitizedRaw + effectiveExt;
+            } else {
+                sanitized = `${sanitizedRaw}.${effectiveExt}`;
+            }
+        } else {
+            sanitized = sanitizedRaw;
+        }
         const fileName = truncateFileName(att.messageId, sanitized, 200);
         const relPath = `images/${fileName}`;
         const dst = path.join(outDir, relPath);
-        const contentType = extToContentType(ext);
+        const contentType = extToContentType(effectiveExt);
         const ref: ExportImageRef = { name: att.name, path: relPath, contentType };
         pending.push({ dst, data: raw, ref, messageId: att.messageId });
     }
@@ -733,7 +768,8 @@ export const runExport = async (
         );
     }
 
-    const result = buildExport({ messages: decrypted, users, channels }, options);
+    const attachmentIds = new Set(attachments.map(a => a.messageId));
+    const result = buildExport({ messages: decrypted, users, channels, attachmentIds }, options);
 
     // A filtered export must NEVER touch the watermark sidecar: its maxTime is
     // only a subset, and writing it would cause later unfiltered --incremental
