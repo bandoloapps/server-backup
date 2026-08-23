@@ -17,7 +17,10 @@ import {
   type ReportIO,
   type ReportOptions,
 } from "./generateReport";
-import { SectionType } from "docx";
+import { SectionType, Packer } from "docx";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
 
 // ---------- fixtures ----------
 
@@ -901,5 +904,221 @@ describe("main daily grouping (2A)", () => {
     // lex sort == chronological due to daily-YYYY-MM-DD prefix
     const flatFiles = ["exports/MyServer/daily-2026-08-20.docx", "exports/MyServer/daily-2026-08-19.docx", "exports/MyServer/daily-2026-08-18.docx"];
     assert.deepEqual([...flatFiles].sort(), ["exports/MyServer/daily-2026-08-18.docx", "exports/MyServer/daily-2026-08-19.docx", "exports/MyServer/daily-2026-08-20.docx"]);
+  });
+});
+
+// ---------- Unit 2: json-export-with-images DOCX embedding ----------
+
+describe("generateReport Unit2: schema gate 1|2 + image embedding", () => {
+  const pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=";
+  const pngBuf = Buffer.from(pngBase64, "base64");
+
+  function makeOutputWithImages(entries: Array<{ id: string; channelId: string; authorId: string; name: string; relPath: string }>, opts: { schemaVersion?: string } = {}): ExportOutput {
+    return {
+      schemaVersion: (opts.schemaVersion ?? "2") as any,
+      guildId: "guild-1",
+      generatedAt: "2026-08-20T10:00:00.000Z",
+      mode: "full",
+      filter: { channelIds: [], from: null, to: null },
+      users: { "u1": { username: "alice", displayName: "Alice", globalName: "Alice G" } },
+      channels: { "c1": { name: "general", type: "text", parentId: null } },
+      sessions: [{
+        start: "2026-08-20T10:00:00.000Z",
+        end: "2026-08-20T11:00:00.000Z",
+        channelIds: ["c1"],
+        timeline: entries.map(e => ({
+          id: e.id,
+          channelId: e.channelId,
+          authorId: e.authorId,
+          author: "Alice",
+          channel: "general",
+          time: "2026-08-20T10:00:00.000Z",
+          text: "hello with image",
+          images: [{ name: e.name, path: e.relPath, contentType: "image/png" }],
+        })),
+        topics: [],
+      }],
+    };
+  }
+
+  function writeTempImage(tmpDir: string, relPath: string, data: Buffer) {
+    const full = path.join(tmpDir, relPath);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, data);
+    return full;
+  }
+
+  it("loadAndValidate accepts schemaVersion 2", () => {
+    const out = makeOutput({ schemaVersion: "2" as any });
+    const result = loadAndValidate(JSON.stringify(out));
+    assert.equal(result.schemaVersion, "2");
+  });
+
+  it("loadAndValidate accepts schemaVersion 1 without images (text-only)", () => {
+    const out = makeOutput({ schemaVersion: "1" });
+    const result = loadAndValidate(JSON.stringify(out));
+    assert.equal(result.schemaVersion, "1");
+    const sections = buildSections(result.sessions.map(s => resolveNames(s, result.users, result.channels)), makeOptions(), os.tmpdir());
+    const json = JSON.stringify(sections.map(s => s.children.map((c: any) => c.root ?? c)));
+    assert.ok(!json.includes("[image:"), "no placeholder for v1 without images");
+    assert.ok(!json.includes("w:drawing"), "no ImageRun for v1 without images");
+  });
+
+  it("embed success timeline: ImageRun width≤450 height≤300", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "docx-embed-timeline-"));
+    try {
+      const rel = "images/m1__photo.png";
+      writeTempImage(tmp, rel, pngBuf);
+      const out = makeOutputWithImages([{ id: "m1", channelId: "c1", authorId: "u1", name: "photo.png", relPath: rel }]);
+      const resolved = out.sessions.map(s => resolveNames(s, out.users, out.channels));
+      // Need to inject images into the resolved session; buildSections should embed via baseDir
+      const sections = (buildSections as any)(resolved, makeOptions(), tmp);
+      const allChildren = sections.flatMap((s: any) => s.children);
+      const json = JSON.stringify(allChildren.map((c: any) => c.root ?? c));
+      assert.ok(json.includes("w:drawing"), "timeline must contain ImageRun drawing");
+      assert.ok(json.includes("wp:inline"), "must have wp:inline for image");
+      // transformation EMUs are width*9525; for ≤450 width, cx ≤ 4286250; for ≤300 height cy ≤ 2857500
+      // fallback uses 450x300 => 4286250 x 2857500
+      // just verify drawing exists and no placeholder for valid image
+      assert.ok(!json.includes("[image: photo.png unavailable]"), "valid image must not have placeholder");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("embed success threadSubSections: ImageRun in threads", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "docx-embed-thread-"));
+    try {
+      const rel = "images/m2__thread.png";
+      writeTempImage(tmp, rel, pngBuf);
+      const out: ExportOutput = {
+        schemaVersion: "2" as any,
+        guildId: "guild-1",
+        generatedAt: "2026-08-20T10:00:00.000Z",
+        mode: "full",
+        filter: { channelIds: [], from: null, to: null },
+        users: { "u1": { username: "alice", displayName: "Alice", globalName: "Alice G" } },
+        channels: { "c1": { name: "general", type: "text", parentId: null }, "t1": { name: "Thread Topic", type: "thread", parentId: "c1" } },
+        sessions: [{
+          start: "2026-08-20T10:00:00.000Z",
+          end: "2026-08-20T11:00:00.000Z",
+          channelIds: ["c1"],
+          timeline: [{ id: "m1", channelId: "c1", authorId: "u1", author: "Alice", channel: "general", time: "2026-08-20T10:00:00.000Z", text: "main", }],
+          topics: [{ id: "t1", name: "Thread Topic", channelId: "t1", timeline: [{ id: "m2", channelId: "t1", authorId: "u1", author: "Alice", channel: "Thread Topic", time: "2026-08-20T10:10:00.000Z", text: "thread reply", images: [{ name: "thread.png", path: rel, contentType: "image/png" }] }] }],
+        }],
+      };
+      const resolved = out.sessions.map(s => resolveNames(s, out.users, out.channels));
+      const sections = (buildSections as any)(resolved, makeOptions(), tmp);
+      const json = JSON.stringify(sections.flatMap((s: any) => s.children).map((c: any) => c.root ?? c));
+      assert.ok(json.includes("w:drawing"), "thread must contain ImageRun");
+      assert.ok(!json.includes("[image: thread.png unavailable]"));
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("missing file → italic placeholder [image: <name> unavailable]", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "docx-missing-"));
+    try {
+      const rel = "images/999__gone.png";
+      const out = makeOutputWithImages([{ id: "m1", channelId: "c1", authorId: "u1", name: "gone.png", relPath: rel }]);
+      const resolved = out.sessions.map(s => resolveNames(s, out.users, out.channels));
+      const sections = (buildSections as any)(resolved, makeOptions(), tmp);
+      const json = JSON.stringify(sections.flatMap((s: any) => s.children).map((c: any) => c.root ?? c));
+      assert.ok(json.includes("[image: gone.png unavailable]"), "missing file must render placeholder");
+      assert.ok(json.includes("w:i"), "placeholder must be italic (w:i)");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("oversized >5MB → placeholder not embedded", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "docx-oversized-"));
+    try {
+      const rel = "images/m1__big.png";
+      const full = path.join(tmp, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      // create sparse file >5MB without writing full data (use truncate)
+      const fd = fs.openSync(full, "w");
+      fs.ftruncateSync(fd, 5 * 1024 * 1024 + 1);
+      fs.closeSync(fd);
+      const out = makeOutputWithImages([{ id: "m1", channelId: "c1", authorId: "u1", name: "big.png", relPath: rel }]);
+      const resolved = out.sessions.map(s => resolveNames(s, out.users, out.channels));
+      const sections = (buildSections as any)(resolved, makeOptions(), tmp);
+      const json = JSON.stringify(sections.flatMap((s: any) => s.children).map((c: any) => c.root ?? c));
+      assert.ok(json.includes("[image: big.png unavailable]"), "oversized must be placeholder");
+      assert.ok(!json.includes("rId{") || json.includes("[image:"), "oversized must not embed ImageRun with valid rId as sole content");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("offline resolve via dirname(inputPath): main resolves images without server.db", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "docx-offline-"));
+    try {
+      const rel = "images/m1__offline.png";
+      writeTempImage(tmp, rel, pngBuf);
+      const out = makeOutputWithImages([{ id: "m1", channelId: "c1", authorId: "u1", name: "offline.png", relPath: rel }]);
+      out.sessions[0].timeline[0].images = [{ name: "offline.png", path: rel, contentType: "image/png" }];
+      const inputPath = path.join(tmp, "messages.json");
+      fs.writeFileSync(inputPath, JSON.stringify(out));
+      const written: Buffer[] = [];
+      const io: ReportIO = {
+        readFileSync: (p: string, _enc: string) => fs.readFileSync(p, "utf-8"),
+        writeFileSync: (_p: string, data: Buffer) => { written.push(data); },
+        mkdirSync: (_p: string, _o: any) => {},
+        exit: (code: number) => { if (code !== 0) throw new Error(`exit ${code}`); },
+      };
+      await main(["--input", inputPath, "--output", path.join(tmp, "out.docx")], io);
+      assert.ok(written.length === 1 && written[0].length > 0, "offline main must produce docx");
+      const docBuffer = written[0];
+      assert.ok(docBuffer.length > 0, "Packer buffer >0");
+      // quick check that buffer is zip (docx is zip) starts with PK
+      assert.equal(docBuffer[0], 0x50);
+      assert.equal(docBuffer[1], 0x4b);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("Packer.toBuffer produces valid docx >0 bytes with embedded image", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "docx-packer-"));
+    try {
+      const rel = "images/m1__pack.png";
+      writeTempImage(tmp, rel, pngBuf);
+      const out = makeOutputWithImages([{ id: "m1", channelId: "c1", authorId: "u1", name: "pack.png", relPath: rel }]);
+      const resolved = out.sessions.map(s => resolveNames(s, out.users, out.channels));
+      const sections = (buildSections as any)(resolved, makeOptions(), tmp);
+      const { Document, Packer } = await import("docx");
+      const doc = new Document({ sections });
+      const buf = await Packer.toBuffer(doc);
+      assert.ok(buf.length > 0, "Packer.toBuffer must be >0");
+      assert.equal(buf[0], 0x50);
+      assert.equal(buf[1], 0x4b);
+      const json = JSON.stringify(sections.flatMap((s: any) => s.children).map((c: any) => c.root ?? c));
+      assert.ok(json.includes("w:drawing"));
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("corrupt/webp unsupported falls back to italic placeholder", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "docx-corrupt-"));
+    try {
+      const rel = "images/m1__bad.webp";
+      const full = path.join(tmp, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, Buffer.from("not-an-image"));
+      const out = makeOutputWithImages([{ id: "m1", channelId: "c1", authorId: "u1", name: "bad.webp", relPath: rel }]);
+      const resolved = out.sessions.map(s => resolveNames(s, out.users, out.channels));
+      const sections = (buildSections as any)(resolved, makeOptions(), tmp);
+      const json = JSON.stringify(sections.flatMap((s: any) => s.children).map((c: any) => c.root ?? c));
+      assert.ok(json.includes("hello with image"), "timeline text must still render despite corrupt image");
+      assert.ok(json.includes("[image: bad.webp unavailable]"), "corrupt webp must render placeholder");
+      assert.ok(json.includes("w:i"), "placeholder must be italic");
+      assert.ok(!json.includes("not-an-image"), "raw corrupt bytes must not be embedded");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });

@@ -12,6 +12,7 @@ import {
   Packer,
   Paragraph,
   TextRun,
+  ImageRun,
   HeadingLevel,
   Table,
   TableRow,
@@ -53,7 +54,94 @@ export interface DocxSection {
 
 // ---------- constants ----------
 
-const SUPPORTED_SCHEMA_VERSIONS = new Set(["1"]);
+export const SUPPORTED_SCHEMA_VERSIONS = new Set(["1", "2"]);
+
+export const MAX_BYTES = 5 * 1024 * 1024;
+
+export const resolveImagePath = (inputPath: string, rel: string): string =>
+  path.join(path.dirname(inputPath), rel);
+
+export const mimeToDocxType = (ext: string): "png" | "jpg" | "gif" => {
+  const e = ext.replace(/^\./, "").toLowerCase();
+  if (e === "png") return "png";
+  if (e === "jpg" || e === "jpeg") return "jpg";
+  if (e === "gif") return "gif";
+  if (e === "webp") return "png";
+  return "png";
+};
+
+export const clampTransform = (
+  naturalWidth?: number,
+  naturalHeight?: number
+): { width: number; height: number } => {
+  const MAX_W = 450;
+  const MAX_H = 300;
+  if (
+    naturalWidth == null ||
+    naturalHeight == null ||
+    naturalWidth <= 0 ||
+    naturalHeight <= 0
+  ) {
+    return { width: MAX_W, height: MAX_H };
+  }
+  let w = Math.min(naturalWidth, MAX_W);
+  let h = Math.round((w * naturalHeight) / naturalWidth);
+  if (h > MAX_H) {
+    h = MAX_H;
+    w = Math.round((h * naturalWidth) / naturalHeight);
+  }
+  return { width: w, height: h };
+};
+
+const isKnownImageMagic = (buf: Buffer): boolean => {
+  if (!buf || buf.length < 2) return false;
+  if (buf.length >= 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return true;
+  if (buf[0] === 0xff && buf[1] === 0xd8) return true;
+  if (buf.length >= 3 && buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return true;
+  if (buf.length >= 12 && buf.subarray(0, 4).toString() === "RIFF" && buf.subarray(8, 12).toString() === "WEBP") return true;
+  return false;
+};
+
+export const tryEmbedImages = (
+  entry: Session["timeline"][number],
+  baseDir: string
+): Paragraph[] => {
+  const images = (entry as unknown as { images?: Array<{ name: string; path: string; contentType: string | null }> }).images;
+  if (!images || images.length === 0) return [];
+  const effectiveBase = baseDir || ".";
+  const out: Paragraph[] = [];
+  for (const img of images) {
+    const fullPath = path.join(effectiveBase, img.path);
+    try {
+      const stat = fs.statSync(fullPath);
+      if (stat.size > MAX_BYTES) throw new Error("oversized");
+      const data = fs.readFileSync(fullPath);
+      if (data.length === 0) throw new Error("empty");
+      if (!isKnownImageMagic(data)) throw new Error("corrupt or unsupported");
+      const ext = path.extname(img.name).replace(/^\./, "").toLowerCase();
+      const type = mimeToDocxType(ext);
+      const { width, height } = clampTransform();
+      const run = new ImageRun({
+        data,
+        transformation: { width, height },
+        type: type as any,
+      } as any);
+      out.push(new Paragraph({ children: [run] }));
+    } catch {
+      out.push(
+        new Paragraph({
+          children: [
+            new TextRun({
+              text: `[image: ${img.name} unavailable]`,
+              italics: true,
+            }),
+          ],
+        })
+      );
+    }
+  }
+  return out;
+};
 
 export const TZ = "America/Sao_Paulo" as const;
 
@@ -473,7 +561,8 @@ function titleAndMetaCompact(
  */
 function timelineBody(
   sessions: Session[],
-  viewMode: ViewMode
+  viewMode: ViewMode,
+  baseDir: string = ""
 ): (Paragraph | Table)[] {
   const children: (Paragraph | Table)[] = [];
 
@@ -516,6 +605,7 @@ function timelineBody(
               ],
             })
           );
+          children.push(...tryEmbedImages(entry, baseDir));
         }
       });
       return children;
@@ -560,6 +650,7 @@ function timelineBody(
               ],
             })
           );
+          children.push(...tryEmbedImages(entry, baseDir));
         }
       }
     }
@@ -584,6 +675,7 @@ function timelineBody(
           ],
         })
       );
+      children.push(...tryEmbedImages(entry, baseDir));
     }
   } else {
     // By-channel: group messages under channel headings
@@ -616,6 +708,7 @@ function timelineBody(
             ],
           })
         );
+        children.push(...tryEmbedImages(entry, baseDir));
       }
     }
   }
@@ -626,7 +719,7 @@ function timelineBody(
 /**
  * Thread sub-sections: each topic as a distinct block with heading + entries.
  */
-function threadSubSections(sessions: Session[]): (Paragraph | Table)[] {
+function threadSubSections(sessions: Session[], baseDir: string = ""): (Paragraph | Table)[] {
   const children: (Paragraph | Table)[] = [];
   const allTopics = sessions.flatMap((s) => s.topics);
 
@@ -651,6 +744,7 @@ function threadSubSections(sessions: Session[]): (Paragraph | Table)[] {
           ],
         })
       );
+      children.push(...tryEmbedImages(entry, baseDir));
     }
   }
 
@@ -727,9 +821,17 @@ function participantIndex(sessions: Session[]): (Paragraph | Table)[] {
  */
 export function buildSections(
   sessions: Session[],
-  options: ReportOptions
+  options: ReportOptions,
+  baseDir?: string
 ): DocxSection[] {
   const serverName = options.serverName ?? "Session Report";
+
+  // Resolve baseDir: explicit arg wins, else dirname(inputPath) if present, else ""
+  const effectiveBase =
+    baseDir ??
+    ((options as unknown as { inputPath?: string }).inputPath
+      ? path.dirname((options as unknown as { inputPath: string }).inputPath)
+      : "");
 
   // Build filter description for metadata
   const filterParts: string[] = [];
@@ -754,11 +856,11 @@ export function buildSections(
       ),
     },
     {
-      children: timelineBody(sessions, options.viewMode),
+      children: timelineBody(sessions, options.viewMode, effectiveBase),
       properties: { type: SectionType.CONTINUOUS },
     },
     {
-      children: threadSubSections(sessions),
+      children: threadSubSections(sessions, effectiveBase),
       properties: { type: SectionType.CONTINUOUS },
     },
     {
@@ -823,9 +925,10 @@ export async function main(
   );
 
   // Build and write output.
+  const baseDir = path.dirname(args.inputPath);
   if (args.output) {
     // Single explicit --output path: one document containing all filtered sessions (bypasses grouping).
-    const sections = buildSections(resolved, args);
+    const sections = buildSections(resolved, args, baseDir);
     const doc = new Document({ sections });
     const buffer = await Packer.toBuffer(doc);
     io.mkdirSync(path.dirname(args.output), { recursive: true });
@@ -838,7 +941,7 @@ export async function main(
     }
     const grouped = groupSessionsByDay(resolved, TZ);
     for (const [day, daySessions] of grouped) {
-      const sections = buildSections(daySessions, args);
+      const sections = buildSections(daySessions, args, baseDir);
       const doc = new Document({ sections });
       const buffer = await Packer.toBuffer(doc);
       const outPath = computeDailyOutputPath(args.serverName, day, output.guildId);
