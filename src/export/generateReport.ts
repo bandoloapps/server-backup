@@ -648,6 +648,33 @@ function titleAndMetaCompact(
 }
 
 /**
+ * Aesthetic message paragraph: 7 runs, after:60 + contextualSpacing, · separator.
+ * Pure helper for timelineBody + threadSubSections parity.
+ */
+function messageParagraph(entry: { channel: string; author: string; time: string; text: string }): Paragraph {
+  let timeText: string;
+  try {
+    timeText = formatMessageTime(entry.time);
+  } catch {
+    timeText = entry.time;
+  }
+  const bodyText = entry.text ?? "";
+  return new Paragraph({
+    spacing: { after: 60 },
+    contextualSpacing: true,
+    children: [
+      new TextRun({ text: `[${entry.channel}]`, font: "Aptos", size: 18, color: "808080" }),
+      new TextRun({ text: " ", font: "Aptos", size: 21 }),
+      new TextRun({ text: entry.author, font: "Aptos", size: 21, bold: true }),
+      new TextRun({ text: " ", font: "Aptos", size: 21 }),
+      new TextRun({ text: timeText, font: "Aptos", size: 18, italics: true, color: "808080" }),
+      new TextRun({ text: " · ", font: "Aptos", size: 18, color: "808080" }),
+      new TextRun({ text: bodyText, font: "Aptos", size: 21 }),
+    ],
+  });
+}
+
+/**
  * Timeline body: messages rendered per view mode.
  * Chronological: single merged timeline sorted by (time, id).
  * By-channel: H2 per channel with that channel's messages.
@@ -688,16 +715,7 @@ function timelineBody(
           return timeCmp !== 0 ? timeCmp : a.id.localeCompare(b.id);
         });
         for (const entry of sorted) {
-          children.push(
-            new Paragraph({
-              children: [
-                new TextRun({ text: `[${entry.channel}] `, bold: true }),
-                new TextRun({ text: `${entry.author} `, bold: true }),
-                new TextRun({ text: `(${entry.time}): `, italics: true }),
-                new TextRun(entry.text),
-              ],
-            })
-          );
+          children.push(messageParagraph(entry));
           children.push(...tryEmbedImages(entry, baseDir));
         }
       });
@@ -734,15 +752,7 @@ function timelineBody(
           })
         );
         for (const entry of entries) {
-          children.push(
-            new Paragraph({
-              children: [
-                new TextRun({ text: `${entry.author} `, bold: true }),
-                new TextRun({ text: `(${entry.time}): `, italics: true }),
-                new TextRun(entry.text),
-              ],
-            })
-          );
+          children.push(messageParagraph(entry));
           children.push(...tryEmbedImages(entry, baseDir));
         }
       }
@@ -758,16 +768,7 @@ function timelineBody(
       return timeCmp !== 0 ? timeCmp : a.id.localeCompare(b.id);
     });
     for (const entry of all) {
-      children.push(
-        new Paragraph({
-          children: [
-            new TextRun({ text: `[${entry.channel}] `, bold: true }),
-            new TextRun({ text: `${entry.author} `, bold: true }),
-            new TextRun({ text: `(${entry.time}): `, italics: true }),
-            new TextRun(entry.text),
-          ],
-        })
-      );
+      children.push(messageParagraph(entry));
       children.push(...tryEmbedImages(entry, baseDir));
     }
   } else {
@@ -792,15 +793,7 @@ function timelineBody(
         })
       );
       for (const entry of entries) {
-        children.push(
-          new Paragraph({
-            children: [
-              new TextRun({ text: `${entry.author} `, bold: true }),
-              new TextRun({ text: `(${entry.time}): `, italics: true }),
-              new TextRun(entry.text),
-            ],
-          })
-        );
+        children.push(messageParagraph(entry));
         children.push(...tryEmbedImages(entry, baseDir));
       }
     }
@@ -828,15 +821,7 @@ function threadSubSections(sessions: Session[], baseDir: string = ""): (Paragrap
       })
     );
     for (const entry of topic.timeline) {
-      children.push(
-        new Paragraph({
-          children: [
-            new TextRun({ text: `${entry.author} `, bold: true }),
-            new TextRun({ text: `(${entry.time}): `, italics: true }),
-            new TextRun(entry.text),
-          ],
-        })
-      );
+      children.push(messageParagraph(entry as any));
       children.push(...tryEmbedImages(entry, baseDir));
     }
   }

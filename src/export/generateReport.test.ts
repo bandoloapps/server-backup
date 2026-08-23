@@ -1531,3 +1531,278 @@ describe("RED docx-aesthetic-refresh PR1: header title/span/metadata (2.1)", () 
     assert.ok(firstJson.includes("48"), "empty title still 48");
   });
 });
+
+// ---------- RED docx-aesthetic-refresh PR2: timeline 7-run · + after:60 + thread parity (Strict TDD 3.1/3.3/3.5) ----------
+
+function assertSevenRunPara(json: string, _expected: { channel: string; author: string; timeIso: string; body: string }) {
+  const rCount = (json.match(/"w:r"/g) || []).length;
+  assert.equal(rCount, 7, `must have exactly 7 w:r, got ${rCount} json: ` + json.slice(0, 1200));
+  // spacing after:60 contextualSpacing
+  assert.ok(json.includes('"w:spacing"'), "must have w:spacing");
+  assert.ok(json.includes('"w:contextualSpacing"'), "must have contextualSpacing");
+  assert.ok(json.includes('"w:after"') && json.includes('"value":60'), "must have after 60, got " + json.slice(0, 800));
+  assert.ok(!json.includes('"value":3600'), "must NOT have after 3600");
+  // sizes: 18 appears 3 times (chan, time, separator), 21 appears 4 times (sp, author, sp, body)
+  const sz18 = (json.match(/"val":18/g) || []).length;
+  const sz21 = (json.match(/"val":21/g) || []).length;
+  // each sz appears duplicated via w:sz + w:szCs so counts double: 3*2=6 for 18, 4*2=8 for 21
+  assert.ok(sz18 >= 6, `need at least 6 sz18 (3 runs ×2), got ${sz18}`);
+  assert.ok(sz21 >= 8, `need at least 8 sz21 (4 runs ×2), got ${sz21}`);
+  // colors 808080 for chan/time/separator (3 runs)
+  const colorCount = (json.match(/808080/g) || []).length;
+  assert.ok(colorCount >= 3, `need >=3 color 808080, got ${colorCount}`);
+  // fonts Aptos everywhere
+  assert.ok(json.includes("Aptos"), "must have font Aptos");
+  // bold for author
+  assert.ok(json.includes('"w:b"'), "must have bold for author (w:b)");
+  // italics for timestamp
+  assert.ok(json.includes('"w:i"'), "must have italics for timestamp (w:i)");
+  // separator · (U+00B7) exactly once between timestamp and body, not :
+  assert.ok(json.includes("·"), "must contain separator · (U+00B7)");
+  const bulletCount = (json.match(/·/g) || []).length;
+  assert.equal(bulletCount, 1, `separator · must appear exactly once, got ${bulletCount}`);
+  // colon after timestamp must NOT exist as ): or :\s
+  // ensure no colon immediately after timestamp pattern "): " old was "): " — new must be " · "
+  // check that json does NOT contain '):' as part of timestamp run
+  // we assert that after timestamp, the separator is · not :
+  // simplistic: ensure json does NOT contain '"w:t" ... "):' with colon
+  // count colon in w:t context: old had ");" colon; new separator has no colon
+  // We'll assert that the json for message para does not contain '):' adjacent to time when inspecting text runs
+  // Extract all w:t texts
+  const texts: string[] = [];
+  const re = /"w:t"[^]*?"([^"]*·[^"]*|[^"]*)"/g;
+  // Instead simple: ensure no run contains '): ' colon suffix for timestamp
+  assert.ok(!json.includes("):"), "must NOT contain '):' timestamp suffix");
+  // separator run must be size 18 color 808080 font Aptos — already covered by size/color/bullet
+  // body text must be present
+  assert.ok(json.includes(_expected.body) || _expected.body === "", `body "${_expected.body}" must be in json`);
+  // channel bracket
+  assert.ok(json.includes(`[${_expected.channel}]`), `channel [${_expected.channel}] must be in json`);
+  // author
+  assert.ok(json.includes(_expected.author), `author ${_expected.author} must be in json`);
+  // timestamp via formatMessageTime SP without seconds
+  const { formatMessageTime } = require("./generateReport");
+  let expectedTime: string;
+  try { expectedTime = formatMessageTime(_expected.timeIso); } catch { expectedTime = _expected.timeIso; }
+  assert.ok(json.includes(expectedTime), `timestamp ${expectedTime} must be in json, got ` + json.slice(0, 900));
+  assert.ok(!expectedTime.includes("T") && !expectedTime.includes("Z"), "expected timestamp must be SP no T/Z");
+}
+
+describe("RED docx-aesthetic-refresh PR2: timelineBody 7-run · after:60 contextualSpacing (3.1)", () => {
+  it("chronological single → every msg 7-run after:60 · no colon", () => {
+    const { buildSections } = require("./generateReport");
+    const output = makeOutput();
+    const resolved = resolveNames(output.sessions[0], output.users, output.channels);
+    const sections = buildSections([resolved], makeOptions({ viewMode: "chronological" }));
+    const timelineChildren = sections[1].children as any[];
+    // filter message paras: those containing body text "Hello world" or "Hi there"
+    const msgTexts = ["Hello world", "Hi there"];
+    const msgParas = timelineChildren.filter((c: any) => {
+      const j = JSON.stringify(c.root ?? c);
+      return msgTexts.some(t => j.includes(t));
+    });
+    assert.equal(msgParas.length, 2, "chronological single must have 2 message paras");
+    for (let i = 0; i < msgParas.length; i++) {
+      const j = JSON.stringify((msgParas[i] as any).root ?? msgParas[i]);
+      assertSevenRunPara(j, {
+        channel: i === 0 ? "general" : "random",
+        author: i === 0 ? "Alice" : "bob",
+        timeIso: i === 0 ? "2026-08-19T20:00:00.000Z" : "2026-08-19T20:30:00.000Z",
+        body: msgTexts[i],
+      });
+    }
+  });
+
+  it("by-channel single → 7-run after:60 each channel group", () => {
+    const { buildSections } = require("./generateReport");
+    const output = makeOutput();
+    const resolved = resolveNames(output.sessions[0], output.users, output.channels);
+    const sections = buildSections([resolved], makeOptions({ viewMode: "by-channel" }));
+    const timelineChildren = sections[1].children as any[];
+    const msgParas = timelineChildren.filter((c: any) => {
+      const j = JSON.stringify(c.root ?? c);
+      return j.includes("Hello world") || j.includes("Hi there");
+    });
+    assert.equal(msgParas.length, 2);
+    for (const p of msgParas) {
+      const j = JSON.stringify((p as any).root ?? p);
+      const isGeneral = j.includes("Hello world");
+      assertSevenRunPara(j, {
+        channel: isGeneral ? "general" : "random",
+        author: isGeneral ? "Alice" : "bob",
+        timeIso: isGeneral ? "2026-08-19T20:00:00.000Z" : "2026-08-19T20:30:00.000Z",
+        body: isGeneral ? "Hello world" : "Hi there",
+      });
+    }
+  });
+
+  it("chronological multi (2 sessions) → 4 branches 7-run preserved", () => {
+    const { buildSections } = require("./generateReport");
+    const s1 = { start: "2026-08-20T10:00:00Z", end: "2026-08-20T11:00:00Z", channelIds: ["c1"], timeline: [{ id: "m1", channelId: "c1", authorId: "u1", author: "Alice", channel: "general", time: "2026-08-20T10:00:00.000Z", text: "first msg" }], topics: [] as any[] };
+    const s2 = { start: "2026-08-20T15:00:00Z", end: "2026-08-20T16:00:00Z", channelIds: ["c1"], timeline: [{ id: "m2", channelId: "c1", authorId: "u1", author: "Alice", channel: "general", time: "2026-08-20T15:00:00.000Z", text: "second msg" }], topics: [] as any[] };
+    const output = makeOutput({ sessions: [s1 as any, s2 as any] });
+    const resolved = output.sessions.map(s => resolveNames(s as any, output.users, output.channels));
+    const sections = buildSections(resolved as any, makeOptions({ viewMode: "chronological" }));
+    const children = sections[1].children as any[];
+    const msgParas = children.filter((c: any) => JSON.stringify(c.root ?? c).includes("msg"));
+    assert.equal(msgParas.length, 2, "multi chronological must have 2 msgs");
+    for (const p of msgParas) {
+      const j = JSON.stringify((p as any).root ?? p);
+      assertSevenRunPara(j, { channel: "general", author: "Alice", timeIso: (j.includes("first") ? "2026-08-20T10:00:00.000Z" : "2026-08-20T15:00:00.000Z"), body: j.includes("first") ? "first msg" : "second msg" });
+    }
+  });
+
+  it("by-channel multi → 7-run parity", () => {
+    const { buildSections } = require("./generateReport");
+    const s1 = { start: "2026-08-20T10:00:00Z", end: "2026-08-20T11:00:00Z", channelIds: ["c1","c2"], timeline: [{ id: "m1", channelId: "c1", authorId: "u1", author: "Alice", channel: "general", time: "2026-08-20T10:00:00.000Z", text: "alpha" }, { id: "m2", channelId: "c2", authorId: "u2", author: "bob", channel: "random", time: "2026-08-20T10:05:00.000Z", text: "beta" }], topics: [] as any[] };
+    const s2 = { start: "2026-08-20T15:00:00Z", end: "2026-08-20T16:00:00Z", channelIds: ["c1"], timeline: [{ id: "m3", channelId: "c1", authorId: "u1", author: "Alice", channel: "general", time: "2026-08-20T15:00:00.000Z", text: "gamma" }], topics: [] as any[] };
+    const output = makeOutput({ sessions: [s1 as any, s2 as any] });
+    const resolved = output.sessions.map(s => resolveNames(s as any, output.users, output.channels));
+    const sections = buildSections(resolved as any, makeOptions({ viewMode: "by-channel" }));
+    const children = sections[1].children as any[];
+    const msgParas = children.filter((c: any) => { const j=JSON.stringify(c.root??c); return j.includes("alpha")||j.includes("beta")||j.includes("gamma"); });
+    assert.equal(msgParas.length, 3);
+    for (const p of msgParas) {
+      const j = JSON.stringify((p as any).root ?? p);
+      const body = j.includes("alpha") ? "alpha" : j.includes("beta") ? "beta" : "gamma";
+      const channel = j.includes("random") || body==="beta" ? "random" : "general";
+      const author = body==="beta" ? "bob" : "Alice";
+      const timeIso = body==="alpha" ? "2026-08-20T10:00:00.000Z" : body==="beta" ? "2026-08-20T10:05:00.000Z" : "2026-08-20T15:00:00.000Z";
+      assertSevenRunPara(j, { channel, author, timeIso, body });
+    }
+  });
+});
+
+describe("RED docx-aesthetic-refresh PR2: threadSubSections 7-run parity (3.3)", () => {
+  it("threads keep HEADING_2 and each thread msg 7-run after:60 ·", () => {
+    const { buildSections } = require("./generateReport");
+    const session: any = {
+      start: "2026-08-19T20:00:00.000Z", end: "2026-08-19T21:00:00.000Z", channelIds: ["c1"],
+      timeline: [{ id: "m1", channelId: "c1", authorId: "u1", author: "Alice", channel: "general", time: "2026-08-19T20:00:00.000Z", text: "main" }],
+      topics: [{ id: "t1", name: "Thread Topic", channelId: "c1", timeline: [{ id: "m2", channelId: "c1", authorId: "u1", author: "Alice", channel: "general", time: "2026-08-19T20:10:00.000Z", text: "thread reply" }] }]
+    };
+    const output = makeOutput({ sessions: [session] });
+    const resolved = output.sessions.map(s => resolveNames(s as any, output.users, output.channels));
+    const sections = buildSections(resolved as any, makeOptions());
+    const threadChildren = sections[2].children as any[];
+    assert.ok(threadChildren.length >= 2, "threads section must have heading + msg");
+    const headingJson = JSON.stringify((threadChildren[0] as any).root ?? threadChildren[0]);
+    // heading must still be HEADING_2 (contains Thread: and heading level)
+    assert.ok(headingJson.includes("Thread: Thread Topic"), "heading must contain Thread: Thread Topic");
+    const msgPara = threadChildren[1] as any;
+    const j = JSON.stringify(msgPara.root ?? msgPara);
+    assertSevenRunPara(j, { channel: "general", author: "Alice", timeIso: "2026-08-19T20:10:00.000Z", body: "thread reply" });
+  });
+
+  it("multiple thread messages each 7-run", () => {
+    const { buildSections } = require("./generateReport");
+    const session: any = {
+      start: "2026-08-19T20:00:00.000Z", end: "2026-08-19T21:00:00.000Z", channelIds: ["c1"],
+      timeline: [], topics: [{ id: "t1", name: "T1", channelId: "c1", timeline: [
+        { id: "m2", channelId: "c1", authorId: "u1", author: "Alice", channel: "general", time: "2026-08-19T20:10:00.000Z", text: "one" },
+        { id: "m3", channelId: "c1", authorId: "u2", author: "bob", channel: "general", time: "2026-08-19T20:11:00.000Z", text: "two" },
+      ]}]
+    };
+    const output = makeOutput({ sessions: [session] });
+    const resolved = output.sessions.map(s => resolveNames(s as any, output.users, output.channels));
+    const sections = buildSections(resolved as any, makeOptions());
+    const threadChildren = sections[2].children as any[];
+    const msgParas = threadChildren.filter((c:any)=>{const j=JSON.stringify(c.root??c); return j.includes('"w:r"') && (j.includes("one")||j.includes("two"));});
+    assert.equal(msgParas.length, 2);
+    for (const p of msgParas) {
+      const j = JSON.stringify((p as any).root ?? p);
+      assertSevenRunPara(j, { channel: "general", author: j.includes("one")?"Alice":"bob", timeIso: j.includes("one")?"2026-08-19T20:10:00.000Z":"2026-08-19T20:11:00.000Z", body: j.includes("one")?"one":"two" });
+    }
+  });
+});
+
+describe("RED docx-aesthetic-refresh PR2: edges unknown emoji empty invalid images (3.5)", () => {
+  it("unknown author/channel fallback 99 → unknown (99) bold 21 + emoji preserved", () => {
+    const { buildSections } = require("./generateReport");
+    const session: any = {
+      start: "2026-08-19T20:00:00.000Z", end: "2026-08-19T21:00:00.000Z", channelIds: ["c99"],
+      timeline: [{ id: "m1", channelId: "c99", authorId: "u99", author: "unknown (u99)", channel: "unknown (c99)", time: "2026-08-19T20:00:00.000Z", text: "hi 👍" }],
+      topics: []
+    };
+    // do not call resolveNames for this edge -> use raw unknown already
+    const sections = buildSections([session as any], makeOptions());
+    const children = sections[1].children as any[];
+    const msgPara = children.find((c:any)=>JSON.stringify(c.root??c).includes("hi 👍")) as any;
+    assert.ok(msgPara, "msg para with emoji must exist");
+    const j = JSON.stringify(msgPara.root ?? msgPara);
+    assertSevenRunPara(j, { channel: "unknown (c99)", author: "unknown (u99)", timeIso: "2026-08-19T20:00:00.000Z", body: "hi 👍" });
+    // emoji preserved already checked via body includes
+    assert.ok(j.includes("👍"), "emoji 👍 must be preserved");
+    // separator · sz18 808080 already asserted via assertSevenRunPara
+  });
+
+  it("empty body still 7 runs with · separator, timestamp not empty", () => {
+    const { buildSections } = require("./generateReport");
+    const session: any = {
+      start: "2026-08-19T20:00:00.000Z", end: "2026-08-19T21:00:00.000Z", channelIds: ["c1"],
+      timeline: [{ id: "m1", channelId: "c1", authorId: "u1", author: "Alice", channel: "general", time: "2026-08-19T20:00:00.000Z", text: "" }],
+      topics: []
+    };
+    const output = makeOutput({ sessions: [session] });
+    const resolved = output.sessions.map(s => resolveNames(s as any, output.users, output.channels));
+    // but we keep our empty session directly to test empty body
+    const sections = buildSections([session as any], makeOptions());
+    const children = sections[1].children as any[];
+    // find msg para by channel+author (since body empty, filter by timestamp)
+    const msgParas = children.filter((c:any)=>{const j=JSON.stringify(c.root??c); return j.includes("[general]") && j.includes("Alice");});
+    assert.ok(msgParas.length >=1, "empty body must still have para");
+    const j = JSON.stringify((msgParas[0] as any).root ?? msgParas[0]);
+    assertSevenRunPara(j, { channel: "general", author: "Alice", timeIso: "2026-08-19T20:00:00.000Z", body: "" });
+    assert.ok(j.includes("·"), "empty body still separator ·");
+  });
+
+  it("invalid time fallback raw string no throw, still 7 runs", () => {
+    const { buildSections } = require("./generateReport");
+    const session: any = {
+      start: "2026-08-19T20:00:00.000Z", end: "2026-08-19T21:00:00.000Z", channelIds: ["c1"],
+      timeline: [{ id: "m1", channelId: "c1", authorId: "u1", author: "Alice", channel: "general", time: "not-a-valid-iso", text: "bad time" }],
+      topics: []
+    };
+    const sections = buildSections([session as any], makeOptions());
+    const children = sections[1].children as any[];
+    const msgPara = children.find((c:any)=>JSON.stringify(c.root??c).includes("bad time")) as any;
+    assert.ok(msgPara, "bad time para must exist");
+    const j = JSON.stringify(msgPara.root ?? msgPara);
+    // should fallback to raw "not-a-valid-iso"
+    assert.ok(j.includes("not-a-valid-iso"), "must fallback to raw invalid time");
+    // still 7 runs
+    const rCount = (j.match(/"w:r"/g)||[]).length;
+    assert.equal(rCount, 7, "invalid time fallback still 7 runs");
+    assert.ok(j.includes("·"), "separator still present even with invalid time");
+    assert.ok(j.includes('"w:spacing"') && j.includes('"w:contextualSpacing"'), "spacing still correct");
+  });
+
+  it("image embedding still after paragraph unchanged", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "docx-pr2-image-"));
+    try {
+      const rel = "images/m1__photo.png";
+      const pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=";
+      const buf = Buffer.from(pngBase64, "base64");
+      const full = path.join(tmp, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, buf);
+      const session: any = {
+        start: "2026-08-20T10:00:00.000Z", end: "2026-08-20T11:00:00.000Z", channelIds: ["c1"],
+        timeline: [{ id: "m1", channelId: "c1", authorId: "u1", author: "Alice", channel: "general", time: "2026-08-19T20:00:00.000Z", text: "with image", images: [{ name: "photo.png", path: rel, contentType: "image/png" }] }],
+        topics: []
+      };
+      const sections = (buildSections as any)([session], makeOptions(), tmp);
+      const children = sections[1].children as any[];
+      // expect at least 2 paras: message + image drawing
+      assert.ok(children.length >= 2, `expected msg + image, got ${children.length}`);
+      const firstJson = JSON.stringify((children[0] as any).root ?? children[0]);
+      const secondJson = JSON.stringify((children[1] as any).root ?? children[1]);
+      // first is message 7-run
+      assertSevenRunPara(firstJson, { channel: "general", author: "Alice", timeIso: "2026-08-19T20:00:00.000Z", body: "with image" });
+      // second is image drawing
+      assert.ok(secondJson.includes("w:drawing") || secondJson.includes("wp:inline"), "second child must be image drawing");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
