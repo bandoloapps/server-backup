@@ -674,6 +674,30 @@ function messageParagraph(entry: { channel: string; author: string; time: string
   });
 }
 
+function sessionHeading(idx: number, session: Session): Paragraph {
+  let span: string;
+  try {
+    span = formatSpan(session.start, session.end);
+  } catch {
+    span = `${session.start} — ${session.end}`;
+  }
+  return new Paragraph({
+    heading: HeadingLevel.HEADING_1,
+    spacing: { before: 240, after: 120 },
+    keepNext: true,
+    keepLines: true,
+    children: [
+      new TextRun({
+        text: `Session ${idx + 1} — ${span} (${session.timeline.length} mensagens)`,
+        font: "Aptos Display",
+        size: 28,
+        color: "404040",
+        bold: true,
+      }),
+    ],
+  });
+}
+
 /**
  * Timeline body: messages rendered per view mode.
  * Chronological: single merged timeline sorted by (time, id).
@@ -699,17 +723,7 @@ function timelineBody(
     // Chronological multi-session: sequential per-session with heading
     if (viewMode === "chronological") {
       sessions.forEach((session, idx) => {
-        children.push(
-          new Paragraph({
-            children: [
-              new TextRun({
-                text: `Session ${idx + 1} — ${session.start} — ${session.end} (${session.timeline.length} messages)`,
-                bold: true,
-              }),
-            ],
-            heading: HeadingLevel.HEADING_1,
-          })
-        );
+        children.push(sessionHeading(idx, session));
         const sorted = [...session.timeline].sort((a, b) => {
           const timeCmp = a.time.localeCompare(b.time);
           return timeCmp !== 0 ? timeCmp : a.id.localeCompare(b.id);
@@ -723,17 +737,7 @@ function timelineBody(
     }
     // By-channel with multiple sessions: still per-session heading then by-channel inside each
     for (const [idx, session] of sessions.entries()) {
-      children.push(
-        new Paragraph({
-          children: [
-            new TextRun({
-              text: `Session ${idx + 1} — ${session.start} — ${session.end}`,
-              bold: true,
-            }),
-          ],
-          heading: HeadingLevel.HEADING_1,
-        })
-      );
+      children.push(sessionHeading(idx, session));
       const byChannel = new Map<string, typeof session.timeline>();
       for (const entry of session.timeline) {
         const list = byChannel.get(entry.channel) ?? [];

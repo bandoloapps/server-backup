@@ -1806,3 +1806,244 @@ describe("RED docx-aesthetic-refresh PR2: edges unknown emoji empty invalid imag
     }
   });
 });
+
+// ---------- RED docx-session-title-polish: heading polish (Strict TDD 1.1-1.6 / 3.1-3.2) ----------
+
+function makeSessionForHeading(start: string, end: string, timelineLen: number, textPrefix = "msg"): any {
+  const timeline = Array.from({ length: timelineLen }, (_, i) => ({
+    id: `m${i + 1}`,
+    channelId: "c1",
+    authorId: "u1",
+    author: "Alice",
+    channel: "general",
+    time: start,
+    text: `${textPrefix} ${i + 1}`,
+  }));
+  return { start, end, channelIds: ["c1"], timeline, topics: [] as any[] };
+}
+
+function getHeadingParas(sections: any[]): any[] {
+  const timelineChildren = sections[1]?.children ?? [];
+  return (timelineChildren as any[]).filter((c: any) => {
+    const j = JSON.stringify(c.root ?? c);
+    return j.includes("Session ") && j.includes(" — ");
+  });
+}
+
+describe("RED docx-session-title-polish: heading typography + pagination (1.1/1.2)", () => {
+  it("1.1 chronological heading rPr/pPr: Heading1 240/120 keepNext keepLines Aptos Display 28 404040 bold", () => {
+    const { buildSections } = require("./generateReport");
+    const s1 = makeSessionForHeading("2024-02-06T11:50:17.088Z", "2024-02-06T19:04:45.917Z", 28);
+    const s2 = makeSessionForHeading("2024-02-07T01:41:19.712Z", "2024-02-07T03:20:44.238Z", 9);
+    const output = makeOutput({ sessions: [s1 as any, s2 as any] });
+    const resolved = output.sessions.map((s: any) => resolveNames(s, output.users, output.channels));
+    const sections = buildSections(resolved as any, makeOptions({ viewMode: "chronological" }));
+    const headings = getHeadingParas(sections as any);
+    assert.equal(headings.length, 2, "chronological multi must have 2 headings");
+    for (const h of headings) {
+      const j = JSON.stringify((h as any).root ?? h);
+      // pPr
+      assert.ok(j.includes("Heading1") || j.includes("HEADING_1"), "heading must retain Heading1 pStyle, got: " + j.slice(0, 600));
+      assert.ok(j.includes("240"), "spacing before 240 missing: " + j.slice(0, 800));
+      assert.ok(j.includes("120"), "spacing after 120 missing: " + j.slice(0, 800));
+      assert.ok(j.toLowerCase().includes("keepnext"), "keepNext missing: " + j.slice(0, 800));
+      assert.ok(j.toLowerCase().includes("keeplines") || j.includes("keepLines"), "keepLines missing: " + j.slice(0, 800));
+      // rPr
+      assert.ok(j.includes("Aptos Display"), "font Aptos Display missing: " + j.slice(0, 800));
+      assert.ok(j.includes("28"), "sz 28 missing: " + j.slice(0, 800));
+      assert.ok(j.includes("404040"), "color 404040 missing: " + j.slice(0, 800));
+      assert.ok(j.includes('"w:b"') || j.includes("w:b"), "bold missing");
+    }
+  });
+
+  it("1.2 by-channel parity: same rPr/pPr asserts on second branch", () => {
+    const { buildSections } = require("./generateReport");
+    const s1 = makeSessionForHeading("2024-02-06T11:50:17.088Z", "2024-02-06T19:04:45.917Z", 28);
+    const s2 = makeSessionForHeading("2024-02-07T01:41:19.712Z", "2024-02-07T03:20:44.238Z", 9);
+    const output = makeOutput({ sessions: [s1 as any, s2 as any] });
+    const resolved = output.sessions.map((s: any) => resolveNames(s, output.users, output.channels));
+    const sections = buildSections(resolved as any, makeOptions({ viewMode: "by-channel" }));
+    const headings = getHeadingParas(sections as any);
+    assert.equal(headings.length, 2, "by-channel multi must have 2 headings");
+    for (const h of headings) {
+      const j = JSON.stringify((h as any).root ?? h);
+      assert.ok(j.includes("Heading1") || j.includes("HEADING_1"), "Heading1 missing by-channel");
+      assert.ok(j.includes("240") && j.includes("120"), "spacing 240/120 missing by-channel");
+      assert.ok(j.toLowerCase().includes("keepnext"), "keepNext missing by-channel");
+      assert.ok(j.toLowerCase().includes("keeplines") || j.includes("keepLines"), "keepLines missing by-channel");
+      assert.ok(j.includes("Aptos Display"), "Aptos Display missing by-channel");
+      assert.ok(j.includes("28"), "sz 28 missing by-channel");
+      assert.ok(j.includes("404040"), "color 404040 missing by-channel");
+      assert.ok(j.includes('"w:b"') || j.includes("w:b"), "bold missing by-channel");
+    }
+  });
+});
+
+describe("RED docx-session-title-polish: humanized SP range + suffix (1.3/1.4)", () => {
+  it("1.3 humanized SP range 6 de fevereiro de 2024, 08:50 — 6 de fevereiro de 2024, 16:04 no T/Z/.088/:ss/UTC", () => {
+    const { buildSections } = require("./generateReport");
+    const s1 = makeSessionForHeading("2024-02-06T11:50:17.088Z", "2024-02-06T19:04:45.917Z", 2);
+    const s2 = makeSessionForHeading("2024-02-07T01:41:19.712Z", "2024-02-07T03:20:44.238Z", 1);
+    const output = makeOutput({ sessions: [s1 as any, s2 as any] });
+    const resolved = output.sessions.map((s: any) => resolveNames(s, output.users, output.channels));
+    const sections = buildSections(resolved as any, makeOptions({ viewMode: "chronological" }));
+    const headings = getHeadingParas(sections as any);
+    assert.ok(headings.length >= 1, "need heading");
+    const j = JSON.stringify(headings[0].root ?? headings[0]);
+    // match extracts w:t texts; simple includes check
+    assert.ok(j.includes("6 de fevereiro de 2024, 08:50"), "must contain humanized 6 de fevereiro 08:50, got: " + j.slice(0, 1200));
+    assert.ok(j.includes(" — "), "must contain em dash separator");
+    assert.ok(!j.includes("T11:50"), "must NOT contain T-time");
+    assert.ok(!j.includes("Z\"") && !j.includes("Z\\"), "must NOT contain Z");
+    assert.ok(!j.includes(".088"), "must NOT contain .088 ms");
+    // no seconds pattern HH:mm:ss in w:t (should be HH:mm only)
+    // extract w:t string if possible
+    const wts: string[] = [];
+    const re = /"text":\s*"([^"]*)"/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(j)) !== null) wts.push(m[1]);
+    const combinedWt = wts.join(" ");
+    assert.ok(!/\d{2}:\d{2}:\d{2}/.test(combinedWt), "must NOT contain seconds HH:mm:ss, got: " + combinedWt);
+    assert.ok(!combinedWt.includes("UTC"), "must NOT contain UTC");
+  });
+
+  it("1.4 suffix (N mensagens) on both viewModes incl 28, 0, 1 keep mensagens invariant", () => {
+    const { buildSections } = require("./generateReport");
+    // chronological 28
+    const s28 = makeSessionForHeading("2024-02-06T11:50:17.088Z", "2024-02-06T19:04:45.917Z", 28);
+    const s9 = makeSessionForHeading("2024-02-07T01:41:19.712Z", "2024-02-07T03:20:44.238Z", 9);
+    const output = makeOutput({ sessions: [s28 as any, s9 as any] });
+    const resolved = output.sessions.map((s: any) => resolveNames(s, output.users, output.channels));
+    const chrono = buildSections(resolved as any, makeOptions({ viewMode: "chronological" }));
+    const byChan = buildSections(resolved as any, makeOptions({ viewMode: "by-channel" }));
+    const hChrono = getHeadingParas(chrono as any);
+    const hByChan = getHeadingParas(byChan as any);
+    const c0 = JSON.stringify(hChrono[0].root ?? hChrono[0]);
+    const c1 = JSON.stringify(hChrono[1].root ?? hChrono[1]);
+    const b0 = JSON.stringify(hByChan[0].root ?? hByChan[0]);
+    const b1 = JSON.stringify(hByChan[1].root ?? hByChan[1]);
+    assert.ok(c0.includes("(28 mensagens)"), "chrono first must end (28 mensagens), got: " + c0.slice(0, 900));
+    assert.ok(c1.includes("(9 mensagens)"), "chrono second must end (9 mensagens)");
+    assert.ok(b0.includes("(28 mensagens)"), "by-channel first must have (28 mensagens)");
+    assert.ok(b1.includes("(9 mensagens)"), "by-channel second must have (9 mensagens)");
+    assert.ok(!c0.includes("(28 mensagem)") || c0.includes("(28 mensagens)"), "must not be singular mensagem");
+    assert.ok(!c0.includes("messages"), "must not be English messages");
+    assert.ok(!b0.includes("messages"), "by-channel must not be English messages");
+    // 0 and 1 edge
+    const s0 = makeSessionForHeading("2024-02-06T11:50:17.088Z", "2024-02-06T19:04:45.917Z", 0);
+    const s1 = makeSessionForHeading("2024-02-07T01:41:19.712Z", "2024-02-07T03:20:44.238Z", 1);
+    const out01 = makeOutput({ sessions: [s0 as any, s1 as any] });
+    const res01 = out01.sessions.map((s: any) => resolveNames(s, out01.users, out01.channels));
+    const sec01 = buildSections(res01 as any, makeOptions({ viewMode: "chronological" }));
+    const h01 = getHeadingParas(sec01 as any);
+    assert.ok(JSON.stringify(h01[0].root ?? h01[0]).includes("(0 mensagens)"), "0 mensagens invariant");
+    assert.ok(JSON.stringify(h01[1].root ?? h01[1]).includes("(1 mensagens)"), "1 mensagens invariant not mensagem");
+    assert.ok(!JSON.stringify(h01[1].root ?? h01[1]).includes("(1 mensagem)\"") || JSON.stringify(h01[1].root ?? h01[1]).includes("(1 mensagens)"), "must keep mensagens plural even for 1");
+  });
+});
+
+describe("RED docx-session-title-polish: guard + fallback (1.5/1.6)", () => {
+  it("1.5 single session guard sessions=[1] yields 0 heading w:t matching Session \\d+ —", () => {
+    const { buildSections } = require("./generateReport");
+    const s1 = makeSessionForHeading("2024-02-06T11:50:17.088Z", "2024-02-06T19:04:45.917Z", 5);
+    const output = makeOutput({ sessions: [s1 as any] });
+    const resolved = output.sessions.map((s: any) => resolveNames(s, output.users, output.channels));
+    const sections = buildSections(resolved as any, makeOptions({ viewMode: "chronological" }));
+    const headings = getHeadingParas(sections as any);
+    assert.equal(headings.length, 0, "single session must have 0 headings, got: " + headings.length);
+    const alsoByChan = buildSections(resolved as any, makeOptions({ viewMode: "by-channel" }));
+    const headingsBy = getHeadingParas(alsoByChan as any);
+    assert.equal(headingsBy.length, 0, "single by-channel must have 0 headings");
+    // also ensure no w:t matches Session \d+ —
+    const allJson = JSON.stringify(alsoByChan.flatMap((s: any) => s.children).map((c: any) => c.root ?? c));
+    // if there is no heading, there should be no Session heading text at all
+    const hasSessionHeading = /Session \d+ —/.test(allJson);
+    assert.ok(!hasSessionHeading, "single session document must NOT contain Session heading text");
+  });
+
+  it("1.6 invalid date fallback start=bad yields bad — 2024-02-06T19:04:45.917Z and doc still generates", () => {
+    const { buildSections } = require("./generateReport");
+    const bad = { start: "bad", end: "2024-02-06T19:04:45.917Z", channelIds: ["c1"], timeline: [{ id: "m1", channelId: "c1", authorId: "u1", author: "Alice", channel: "general", time: "2024-02-06T19:04:45.917Z", text: "hi" }], topics: [] as any[] };
+    const s2 = makeSessionForHeading("2024-02-07T01:41:19.712Z", "2024-02-07T03:20:44.238Z", 2);
+    const output = makeOutput({ sessions: [bad as any, s2 as any] });
+    const resolved = output.sessions.map((s: any) => resolveNames(s, output.users, output.channels));
+    const sections = buildSections(resolved as any, makeOptions({ viewMode: "chronological" }));
+    const headings = getHeadingParas(sections as any);
+    assert.equal(headings.length, 2, "invalid date still must emit 2 headings");
+    const j0 = JSON.stringify(headings[0].root ?? headings[0]);
+    assert.ok(j0.includes("bad — 2024-02-06T19:04:45.917Z"), "must fallback to raw bad — ISO, got: " + j0.slice(0, 900));
+    // fallback heading must still have Aptos Display 28 404040 bold + 240/120 keepNext keepLines
+    assert.ok(j0.includes("Aptos Display"), "fallback heading must have Aptos Display, got: " + j0.slice(0, 600));
+    assert.ok(j0.includes("28"), "fallback sz 28 missing");
+    assert.ok(j0.includes("404040"), "fallback color 404040 missing");
+    assert.ok(j0.includes("240") && j0.includes("120"), "fallback spacing 240/120 missing");
+    assert.ok(j0.toLowerCase().includes("keepnext"), "fallback keepNext missing");
+    // second heading still humanized
+    const j1 = JSON.stringify(headings[1].root ?? headings[1]);
+    assert.ok(j1.includes("mensagens"), "second heading still mensagens");
+    // doc generation not throwing already proven by buildSections success
+  });
+});
+
+describe("RED docx-session-title-polish: no leak invariant (3.1)", () => {
+  it("3.1 no legacy leak: headings contain no 2E74B5 sz 32 Times spacing 0 ISO", () => {
+    const { buildSections } = require("./generateReport");
+    const s1 = makeSessionForHeading("2024-02-06T11:50:17.088Z", "2024-02-06T19:04:45.917Z", 2);
+    const s2 = makeSessionForHeading("2024-02-07T01:41:19.712Z", "2024-02-07T03:20:44.238Z", 2);
+    const output = makeOutput({ sessions: [s1 as any, s2 as any] });
+    const resolved = output.sessions.map((s: any) => resolveNames(s, output.users, output.channels));
+    for (const vm of ["chronological", "by-channel"] as const) {
+      const sections = buildSections(resolved as any, makeOptions({ viewMode: vm }));
+      const headings = getHeadingParas(sections as any);
+      assert.ok(headings.length > 0, vm + " must have headings");
+      for (const h of headings) {
+        const j = JSON.stringify((h as any).root ?? h);
+        assert.ok(!j.includes("2E74B5"), vm + " must NOT contain 2E74B5 blue, got: " + j.slice(0, 700));
+        // check not sz 32 alone, but sz 28 must exist - ensure 32 absent in heading rPr context
+        // naive: if contains '"val":32' and heading, it's leak; but body may have 32 elsewhere - scope to heading
+        assert.ok(!j.includes('"val":32') || j.includes("48"), vm + " must NOT contain sz 32 (Heading1 blue inheritance), got val 32");
+        assert.ok(!j.toLowerCase().includes("times"), vm + " must NOT contain Times font");
+        // no ISO leak in w:t part of heading
+        const wtMatch = j.match(/"text":\s*"([^"]*)"/g);
+        const headingText = wtMatch ? wtMatch.join(" ") : j;
+        assert.ok(!/T\d{2}:/.test(headingText) || headingText.includes("bad —"), vm + " heading must NOT leak ISO T time, got: " + headingText.slice(0, 500));
+        assert.ok(!headingText.includes("Z\"") && !/\.\\d{3}Z/.test(headingText) && !headingText.includes(".088"), vm + " must NOT leak Z/ms");
+        // also no missing rFonts/sz/color - must have them (already asserted) but re-check leak: every heading rPr has rFonts
+        assert.ok(j.includes("rFonts") || j.includes("Aptos Display"), vm + " heading rPr must have rFonts");
+        assert.ok(!j.includes("\"value\":0") || j.includes("240"), vm + " spacing 0 leak check: heading must have 240/120 not 0");
+      }
+    }
+  });
+});
+
+describe("RED docx-session-title-polish: count accuracy after filter (3.2)", () => {
+  it("3.2 filtered to 9 msgs via filterSessions then heading suffix (9 mensagens) matches timeline.length", () => {
+    const { buildSections, filterSessions } = require("./generateReport");
+    // Create session with 20 messages across c1/c2, filter to c1 only => 9 remain?
+    // Simpler: create s1 with 28, s2 with 9, filterSessions by channelIds ["c1"] that leaves subset?
+    // Instead directly test filtered sessions as input to buildSections: count should reflect filtered timeline.length
+    const base = makeOutput({
+      sessions: [
+        { start: "2024-02-06T11:50:17.088Z", end: "2024-02-06T19:04:45.917Z", channelIds: ["c1", "c2"], timeline: Array.from({ length: 20 }, (_, i) => ({ id: `m${i}`, channelId: i < 11 ? "c1" : "c2", authorId: "u1", author: "Alice", channel: i < 11 ? "general" : "random", time: "2024-02-06T12:00:00.000Z", text: `t${i}` })), topics: [] as any[] },
+        { start: "2024-02-07T01:41:19.712Z", end: "2024-02-07T03:20:44.238Z", channelIds: ["c1"], timeline: Array.from({ length: 9 }, (_, i) => ({ id: `n${i}`, channelId: "c1", authorId: "u1", author: "Alice", channel: "general", time: "2024-02-07T01:45:00.000Z", text: `u${i}` })), topics: [] as any[] },
+      ],
+    });
+    // Filter to keep only c1 -> first session timeline length becomes 11, not 20
+    const filtered = filterSessions(base, makeOptions({ channelIds: ["c1"] }));
+    // second session remains 9
+    assert.equal(filtered[0].timeline.length, 11, "first filtered len 11");
+    assert.equal(filtered[1].timeline.length, 9, "second filtered len 9");
+    const resolved = filtered.map((s: any) => resolveNames(s, base.users, base.channels));
+    const sections = buildSections(resolved as any, makeOptions({ viewMode: "chronological" }));
+    const headings = getHeadingParas(sections as any);
+    assert.equal(headings.length, 2);
+    const j0 = JSON.stringify(headings[0].root ?? headings[0]);
+    const j1 = JSON.stringify(headings[1].root ?? headings[1]);
+    assert.ok(j0.includes("(11 mensagens)"), "first heading must reflect filtered 11, got: " + j0.slice(0, 700));
+    assert.ok(j1.includes("(9 mensagens)"), "second heading must reflect filtered 9, got: " + j1.slice(0, 700));
+    // also by-channel parity
+    const byChan = buildSections(resolved as any, makeOptions({ viewMode: "by-channel" }));
+    const hBy = getHeadingParas(byChan as any);
+    assert.ok(JSON.stringify(hBy[1].root ?? hBy[1]).includes("(9 mensagens)"), "by-channel filtered suffix matches");
+  });
+});
