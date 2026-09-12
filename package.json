@@ -10,7 +10,7 @@
     "decrypt": "node decryptDb.js",
     "export": "node dist/export/exportMessages.js",
     "report": "node dist/export/generateReport.js",
-    "test": "npx tsx --test src/export/generateReport.test.ts src/export/exportMessages.test.ts"
+    "test": "npx tsx --test src/export/generateReport.test.ts src/export/exportMessages.test.ts src/services/initialBackupServices.test.ts"
   },
   "keywords": [
     "Discord Server Backup",

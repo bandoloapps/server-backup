@@ -10,13 +10,9 @@ import consola from "consola";
 import { Collection, GuildTextBasedChannel, Message } from "discord.js";
 import { get_msg_content, save_msg_to_db } from "./messageServices";
 import { fetch_channels } from "./channelServices";
-import { guild_id, initial_backup, initial_backup_force_fresh, initial_backup_worker_count } from "../config/config";
+import { guild_id, ignore_channels, initial_backup, initial_backup_force_fresh, initial_backup_worker_count } from "../config/config";
 import { attachments_model, channels_model, client, initial_backup_checkpoints_model, initial_backup_progress_model, messages_model, sequelize, users_model } from "..";
-
-type ChannelUnit = {
-    channel: GuildTextBasedChannel;
-    cursor?: Message;
-};
+import { build_cursor_map, crawl_forward, incremental_candidates, is_ignored, type ChannelUnit, unit_guards } from "./initialBackupIncremental";
 
 let all_channels: ChannelUnit[] = [];
 let get_a_channel = () => all_channels.pop();
@@ -136,6 +132,20 @@ export const initial_backup_scraper = async () => {
                 all_channels.push({channel, cursor: undefined});
             }
 
+            //incremental catchup (R1): every complete row with a messages-derived cursor re-pages forward via after:
+            //checkpoint stays complete — the messages table is the sole resume state (R2)
+            const cursor_map = await build_cursor_map(messages_model);
+            for(const {channelId, after} of incremental_candidates(checkpoints, cursor_map, ignore_channels)){
+                let channel: GuildTextBasedChannel | null = null;
+                try{
+                    channel = await client.channels.fetch(channelId) as GuildTextBasedChannel | null;
+                }catch(err: any){
+                    channel = null;
+                }
+                if(!channel) continue; //deleted/removed → checkpoint stays complete, nothing to catch up
+                all_channels.push({channel, cursor: undefined, after, direction: 'forward'});
+            }
+
             //restore cumulative counters from the singleton so progress never goes backward (Decision 6)
             try{
                 const progress: any = await initial_backup_progress_model.findByPk(1);
@@ -185,12 +195,15 @@ export const initial_backup_process = async () => {
             if(!unit) break; //successfully went through all the channels
 
             //per-channel isolation: failure leaves the channel in_progress, crawl continues (Decision 5)
+            //forward units: never in_progress, never channels_done++ — checkpoint stays complete (R2/R3)
             try{
-                await upsert_checkpoint(unit.channel.id, 'in_progress', unit.cursor?.id);
-                await crawl_channel(unit.channel, unit.cursor);
-
-                channels_done++;
-                await upsert_checkpoint(unit.channel.id, 'complete', undefined);
+                const guards = unit_guards(unit);
+                if(guards.writeInProgress) await upsert_checkpoint(unit.channel.id, 'in_progress', unit.cursor?.id);
+                await crawl_channel(unit.channel, unit.cursor, unit.after);
+                if(guards.countDone){
+                    channels_done++;
+                    await upsert_checkpoint(unit.channel.id, 'complete', undefined);
+                }
             }catch(err: any){
                 consola.error(`Failed on channel ${unit.channel.id}: ${err.message}`);
             }
@@ -201,9 +214,57 @@ export const initial_backup_process = async () => {
     }
 }
 
-const crawl_channel = async (channel: GuildTextBasedChannel, start_cursor: Message | undefined) => {
+const save_message_and_threads = async (msg: Message) => {
+    const raw_data = await get_msg_content(msg);
+    await save_msg_to_db(raw_data, messages_model, attachments_model, users_model, channels_model)
+
+    if(raw_data.thread){
+        if(is_ignored(msg.channelId, ignore_channels)) return; //R4: ignored parent → never enqueue its threads
+        //thread rows are written at enqueue so a crash never loses them (Decision 4)
+        channels_total++;
+        await upsert_checkpoint(raw_data.thread.id, 'pending', undefined);
+        all_channels.push({channel: raw_data.thread, cursor: undefined});
+    }
+};
+
+const crawl_channel = async (channel: GuildTextBasedChannel, start_cursor: Message | undefined, after_id?: string) => {
+    const is_forward = after_id !== undefined;
     let cursor: Message | undefined = start_cursor;
     let fetched_messages = new Collection<string, Message>();;
+
+    if(is_forward){
+        //forward incremental mode (R1): page ascending via after:, stop when a page has <100
+        if(!channel.messages) return; //category channel → nothing to crawl
+
+        const {last_after} = await crawl_forward(
+            async (after) => Array.from((await channel.messages.fetch({limit: 100, after})).values()),
+            after_id,
+            async (page) => {
+                processed_total += page.length;
+                //per-page txn for forward units: progress only, checkpoint untouched (R2)
+                try{
+                    await sequelize.transaction(async (t) => {
+                        await initial_backup_progress_model.upsert({
+                            id: 1,
+                            processedTotal: processed_total,
+                            channelsDone: channels_done,
+                            channelsTotal: channels_total,
+                            startedAt,
+                            lastUpdated: Date.now(),
+                            status: 'running'
+                        }, {transaction: t});
+                    });
+                }catch(err: any){
+                    consola.error(`Failed to persist progress for ${channel.id}: ${err.message}`);
+                }
+            },
+            save_message_and_threads
+        );
+
+        //logging
+        consola.success(`${channels_done}/${channels_total} Total Msg Processed: ${processed_total} Seconds Passed: ${((Date.now()-startedAt)/1000).toFixed(0)} Last: ${last_after}`);
+        return;
+    }
 
     do{
         if(!channel.messages) break; //this means the channel is a category channel
@@ -216,17 +277,7 @@ const crawl_channel = async (channel: GuildTextBasedChannel, start_cursor: Messa
         cursor = Array.from(fetched_messages)[fetched_messages.size-1][1]; //setting the last message, this is very important so we can keep the loop going
 
         for(let raw_msg of fetched_messages){
-            const msg = raw_msg[1];
-            
-            const raw_data = await get_msg_content(msg);
-            await save_msg_to_db(raw_data, messages_model, attachments_model, users_model, channels_model)
-
-            if(raw_data.thread){
-                //thread rows are written at enqueue so a crash never loses them (Decision 4)
-                channels_total++;
-                await upsert_checkpoint(raw_data.thread.id, 'pending', undefined);
-                all_channels.push({channel: raw_data.thread, cursor: undefined});
-            }
+            await save_message_and_threads(raw_msg[1]);
         }
 
         //one transaction per page: cursor + progress counters stay consistent (Decision 6)
