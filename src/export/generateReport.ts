@@ -69,6 +69,19 @@ export interface DocxSection {
   properties?: ISectionPropertiesOptions;
 }
 
+/** User identity shape from ExportOutput.users (exportMessages.ts:523-528). */
+export type UserInfo = {
+  username: string | null;
+  displayName: string | null;
+  globalName: string | null;
+};
+
+/** One text segment: plain body text or a bold resolved mention. */
+export interface MentionSegment {
+  text: string;
+  bold: boolean;
+}
+
 // ---------- constants ----------
 
 export const SUPPORTED_SCHEMA_VERSIONS = new Set(["1", "2"]);
@@ -378,6 +391,41 @@ export function resolveNames(
 }
 
 /**
+ * Split bodyText into alternating plain/bold segments, resolving `<@id>` and
+ * `<@!id>` mentions to `@displayName` (bold) via the users map. Unknown ids
+ * fall back to `unknown (<id>)`; `<@&role>` and `<#channel>` markup is
+ * preserved raw as plain text. Empty/undefined users map is treated as empty.
+ * Always returns at least one segment (text as-is when no mention matches).
+ */
+export function resolveMentions(
+  text: string,
+  users?: Record<string, UserInfo>
+): MentionSegment[] {
+  const body = text ?? "";
+  const segments: MentionSegment[] = [];
+  const re = /<@!?(\d+)>/g;
+  let match: RegExpExecArray | null;
+  let last = 0;
+  while ((match = re.exec(body)) !== null) {
+    if (match.index > last) {
+      segments.push({ text: body.slice(last, match.index), bold: false });
+    }
+    const id = match[1];
+    const u = users?.[id];
+    const name = u?.displayName ?? u?.username ?? u?.globalName ?? `unknown (${id})`;
+    segments.push({ text: `@${name}`, bold: true });
+    last = match.index + match[0].length;
+  }
+  if (last < body.length) {
+    segments.push({ text: body.slice(last), bold: false });
+  }
+  if (segments.length === 0) {
+    segments.push({ text: body, bold: false });
+  }
+  return segments;
+}
+
+/**
  * Compute the default output path for a session report.
  *
  * Slug format: YYYY-MM-DD_HHmm from the session's first message timestamp (D1).
@@ -648,10 +696,15 @@ function titleAndMetaCompact(
 }
 
 /**
- * Aesthetic message paragraph: 7 runs, after:60 + contextualSpacing, · separator.
+ * Aesthetic message paragraph: 7 runs (plus mention-segment runs), after:60 +
+ * contextualSpacing, · separator. Body text is split by resolveMentions into
+ * alternating plain/bold runs; users is optional for backward compatibility.
  * Pure helper for timelineBody + threadSubSections parity.
  */
-function messageParagraph(entry: { channel: string; author: string; time: string; text: string }): Paragraph {
+function messageParagraph(
+  entry: { channel: string; author: string; time: string; text: string },
+  users?: Record<string, UserInfo>
+): Paragraph {
   let timeText: string;
   try {
     timeText = formatMessageTime(entry.time);
@@ -669,7 +722,9 @@ function messageParagraph(entry: { channel: string; author: string; time: string
       new TextRun({ text: " ", font: "Aptos", size: 21 }),
       new TextRun({ text: timeText, font: "Aptos", size: 18, italics: true, color: "808080" }),
       new TextRun({ text: " · ", font: "Aptos", size: 18, color: "808080" }),
-      new TextRun({ text: bodyText, font: "Aptos", size: 21 }),
+      ...resolveMentions(bodyText, users).map(
+        (s) => new TextRun({ text: s.text, font: "Aptos", size: 21, bold: s.bold })
+      ),
     ],
   });
 }
@@ -706,7 +761,8 @@ function sessionHeading(idx: number, session: Session): Paragraph {
 function timelineBody(
   sessions: Session[],
   viewMode: ViewMode,
-  baseDir: string = ""
+  baseDir: string = "",
+  users?: Record<string, UserInfo>
 ): (Paragraph | Table)[] {
   const children: (Paragraph | Table)[] = [];
 
@@ -729,7 +785,7 @@ function timelineBody(
           return timeCmp !== 0 ? timeCmp : a.id.localeCompare(b.id);
         });
         for (const entry of sorted) {
-          children.push(messageParagraph(entry));
+          children.push(messageParagraph(entry, users));
           children.push(...tryEmbedImages(entry, baseDir));
         }
       });
@@ -756,7 +812,7 @@ function timelineBody(
           })
         );
         for (const entry of entries) {
-          children.push(messageParagraph(entry));
+          children.push(messageParagraph(entry, users));
           children.push(...tryEmbedImages(entry, baseDir));
         }
       }
@@ -772,7 +828,7 @@ function timelineBody(
       return timeCmp !== 0 ? timeCmp : a.id.localeCompare(b.id);
     });
     for (const entry of all) {
-      children.push(messageParagraph(entry));
+      children.push(messageParagraph(entry, users));
       children.push(...tryEmbedImages(entry, baseDir));
     }
   } else {
@@ -797,7 +853,7 @@ function timelineBody(
         })
       );
       for (const entry of entries) {
-        children.push(messageParagraph(entry));
+        children.push(messageParagraph(entry, users));
         children.push(...tryEmbedImages(entry, baseDir));
       }
     }
@@ -809,7 +865,11 @@ function timelineBody(
 /**
  * Thread sub-sections: each topic as a distinct block with heading + entries.
  */
-function threadSubSections(sessions: Session[], baseDir: string = ""): (Paragraph | Table)[] {
+function threadSubSections(
+  sessions: Session[],
+  baseDir: string = "",
+  users?: Record<string, UserInfo>
+): (Paragraph | Table)[] {
   const children: (Paragraph | Table)[] = [];
   const allTopics = sessions.flatMap((s) => s.topics);
 
@@ -825,7 +885,7 @@ function threadSubSections(sessions: Session[], baseDir: string = ""): (Paragrap
       })
     );
     for (const entry of topic.timeline) {
-      children.push(messageParagraph(entry as any));
+      children.push(messageParagraph(entry as any, users));
       children.push(...tryEmbedImages(entry, baseDir));
     }
   }
@@ -904,7 +964,8 @@ function participantIndex(sessions: Session[]): (Paragraph | Table)[] {
 export function buildSections(
   sessions: Session[],
   options: ReportOptions,
-  baseDir?: string
+  baseDir?: string,
+  users?: Record<string, UserInfo>
 ): DocxSection[] {
   const serverName = options.serverName ?? "Session Report";
 
@@ -938,11 +999,11 @@ export function buildSections(
       ),
     },
     {
-      children: timelineBody(sessions, options.viewMode, effectiveBase),
+      children: timelineBody(sessions, options.viewMode, effectiveBase, users),
       properties: { type: SectionType.CONTINUOUS },
     },
     {
-      children: threadSubSections(sessions, effectiveBase),
+      children: threadSubSections(sessions, effectiveBase, users),
       properties: { type: SectionType.CONTINUOUS },
     },
     {
@@ -1010,7 +1071,7 @@ export async function main(
   const baseDir = path.dirname(args.inputPath);
   if (args.output) {
     // Single explicit --output path: one document containing all filtered sessions (bypasses grouping).
-    const sections = buildSections(resolved, args, baseDir);
+    const sections = buildSections(resolved, args, baseDir, output.users);
     const doc = new Document({ sections });
     const buffer = await Packer.toBuffer(doc);
     io.mkdirSync(path.dirname(args.output), { recursive: true });
@@ -1023,7 +1084,7 @@ export async function main(
     }
     const grouped = groupSessionsByDay(resolved, TZ);
     for (const [day, daySessions] of grouped) {
-      const sections = buildSections(daySessions, args, baseDir);
+      const sections = buildSections(daySessions, args, baseDir, output.users);
       const doc = new Document({ sections });
       const buffer = await Packer.toBuffer(doc);
       const outPath = computeDailyOutputPath(args.serverName, day, output.guildId);

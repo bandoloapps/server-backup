@@ -5,6 +5,7 @@ import {
   loadAndValidate,
   filterSessions,
   resolveNames,
+  resolveMentions,
   computeOutputPath,
   computeDailyOutputPath,
   formatDay,
@@ -19,6 +20,7 @@ import {
   type ExportOutput,
   type ReportIO,
   type ReportOptions,
+  type UserInfo,
 } from "./generateReport";
 import { SectionType, Packer } from "docx";
 import * as fs from "fs";
@@ -268,6 +270,76 @@ describe("resolveNames", () => {
     const result = resolveNames(session, output.users, output.channels);
     // u2: displayName=null → falls back to username="bob"
     assert.equal(result.topics[0].timeline[0].author, "bob");
+  });
+});
+
+// ---------- resolveMentions ----------
+
+describe("resolveMentions", () => {
+  const users: Record<string, UserInfo> = {
+    "292426742264627200": { username: "pete", displayName: "Pete", globalName: "Pete G" },
+    "1": { username: "alice", displayName: "Alice", globalName: "Alice G" },
+    "2": { username: "bob", displayName: null, globalName: "Bob G" },
+    "456": { username: "bobby", displayName: "Bobby", globalName: null },
+  };
+
+  it("single mention resolves to bold @displayName", () => {
+    assert.deepEqual(resolveMentions("Hi <@292426742264627200>!", users), [
+      { text: "Hi ", bold: false },
+      { text: "@Pete", bold: true },
+      { text: "!", bold: false },
+    ]);
+  });
+
+  it("multi-mention order and punctuation preserved with displayName ?? username ?? globalName precedence", () => {
+    assert.deepEqual(resolveMentions("<@1> and <@2>, ok?", users), [
+      { text: "@Alice", bold: true },
+      { text: " and ", bold: false },
+      { text: "@bob", bold: true },
+      { text: ", ok?", bold: false },
+    ]);
+  });
+
+  it("legacy <@!id> resolves identically", () => {
+    assert.deepEqual(resolveMentions("hey <@!456>!", users), [
+      { text: "hey ", bold: false },
+      { text: "@Bobby", bold: true },
+      { text: "!", bold: false },
+    ]);
+  });
+
+  it("plain text without mentions returns a single plain segment", () => {
+    assert.deepEqual(resolveMentions("hello world", users), [
+      { text: "hello world", bold: false },
+    ]);
+  });
+
+  it("unknown id falls back to @unknown (<id>)", () => {
+    assert.deepEqual(resolveMentions("<@903320665959039027> hi", users), [
+      { text: "@unknown (903320665959039027)", bold: true },
+      { text: " hi", bold: false },
+    ]);
+  });
+
+  it("role <@&123> and channel <#456> markup stays raw plain", () => {
+    assert.deepEqual(resolveMentions("hey <@&123> see <#456>", users), [
+      { text: "hey <@&123> see <#456>", bold: false },
+    ]);
+  });
+
+  it("undefined or empty users map → @unknown (<id>), no crash", () => {
+    assert.deepEqual(resolveMentions("<@1> hi", undefined), [
+      { text: "@unknown (1)", bold: true },
+      { text: " hi", bold: false },
+    ]);
+    assert.deepEqual(resolveMentions("<@1> hi", {}), [
+      { text: "@unknown (1)", bold: true },
+      { text: " hi", bold: false },
+    ]);
+  });
+
+  it("empty body → single empty plain segment", () => {
+    assert.deepEqual(resolveMentions("", users), [{ text: "", bold: false }]);
   });
 });
 
@@ -645,6 +717,164 @@ describe("buildSections compact header (1A)", () => {
     assert.ok(firstJson.includes("0 sessions") || firstJson.includes("No sessions"), "header must show 0 sessions");
     for (let i = 1; i < sections.length; i++) {
       assert.equal(sections[i].properties?.type, SectionType.CONTINUOUS);
+    }
+  });
+});
+
+// ---------- resolveMentions run emission via buildSections ----------
+
+type MentionRun = { text: string; bold: boolean; size: number };
+
+/** Walk a serialized paragraph tree and summarize each w:r run in order. */
+function summarizeRuns(parRoot: unknown): MentionRun[] {
+  const runs: MentionRun[] = [];
+  const visit = (n: unknown, ctx: { run: MentionRun | null }): void => {
+    if (Array.isArray(n)) {
+      for (const x of n) visit(x, ctx);
+      return;
+    }
+    if (!n || typeof n !== "object") return;
+    const obj = n as Record<string, unknown>;
+    const rk = obj.rootKey;
+    if (rk === "w:r") {
+      const run: MentionRun = { text: "", bold: false, size: 0 };
+      visit(obj.root, { run });
+      runs.push(run);
+      return;
+    }
+    if (ctx.run) {
+      if (rk === "w:b") {
+        // bold:true serializes to w:b with an empty root; bold:false has _attr val:false
+        ctx.run.bold = Array.isArray(obj.root) && obj.root.length === 0;
+      } else if (rk === "w:sz") {
+        const attr = (Array.isArray(obj.root) ? obj.root : []).find(
+          (x): x is Record<string, unknown> =>
+            !!x && typeof x === "object" && (x as Record<string, unknown>).rootKey === "_attr"
+        );
+        const v = (attr?.root as { val?: number } | undefined)?.val;
+        if (typeof v === "number") ctx.run.size = v;
+      } else if (rk === "w:t") {
+        for (const item of Array.isArray(obj.root) ? obj.root : []) {
+          if (typeof item === "string") ctx.run.text += item;
+        }
+      }
+    }
+    visit(obj.root, ctx);
+    for (const k of Object.keys(obj)) {
+      if (k !== "root") visit(obj[k], ctx);
+    }
+  };
+  visit(parRoot, { run: null });
+  return runs;
+}
+
+/** Body runs (after the "·" separator) of the first message paragraph in the timeline section. */
+function messageBodyRuns(sections: ReturnType<typeof buildSections>): MentionRun[] {
+  const timelineChildren = sections[1].children as unknown[];
+  const par = timelineChildren.find((c: any) =>
+    JSON.stringify(c.root ?? c).includes(" · ")
+  );
+  assert.ok(par, "message paragraph must exist in timeline section");
+  const runs = summarizeRuns((par as any).root ?? par);
+  const sepIdx = runs.findIndex((r) => r.text.includes(" · "));
+  assert.ok(sepIdx >= 0, "separator run must exist in message paragraph");
+  return runs.slice(sepIdx + 1);
+}
+
+/** Session with one message whose text contains mentions, rendered with users threaded. */
+function mentionSections(
+  text: string,
+  extraUsers: Record<string, UserInfo> = {}
+): ReturnType<typeof buildSections> {
+  const output = makeOutput();
+  output.users = { ...output.users, ...extraUsers };
+  output.sessions[0].timeline[0].text = text;
+  const resolved = resolveNames(output.sessions[0], output.users, output.channels);
+  return buildSections([resolved], makeOptions(), "", output.users);
+}
+
+describe("buildSections mention bold emission (R1/R2)", () => {
+  it("single mention → plain/bold/plain sz21 alternation in original order", () => {
+    const sections = mentionSections("Hi <@292426742264627200>!", {
+      "292426742264627200": { username: "pete", displayName: "Pete", globalName: "Pete G" },
+    });
+    assert.deepEqual(messageBodyRuns(sections), [
+      { text: "Hi ", bold: false, size: 21 },
+      { text: "@Pete", bold: true, size: 21 },
+      { text: "!", bold: false, size: 21 },
+    ]);
+  });
+
+  it("multi-mention legacy ! order and punctuation preserved at paragraph level", () => {
+    const sections = mentionSections("<@1> and <@!2>, ok?", {
+      "1": { username: "alice", displayName: "Alice", globalName: "Alice G" },
+      "2": { username: "bob", displayName: null, globalName: "Bob G" },
+    });
+    assert.deepEqual(messageBodyRuns(sections), [
+      { text: "@Alice", bold: true, size: 21 },
+      { text: " and ", bold: false, size: 21 },
+      { text: "@bob", bold: true, size: 21 },
+      { text: ", ok?", bold: false, size: 21 },
+    ]);
+  });
+
+  it("unknown id → bold @unknown (<id>) at paragraph level", () => {
+    const sections = mentionSections("<@903320665959039027> hi");
+    assert.deepEqual(messageBodyRuns(sections), [
+      { text: "@unknown (903320665959039027)", bold: true, size: 21 },
+      { text: " hi", bold: false, size: 21 },
+    ]);
+  });
+
+  it("undefined users at paragraph level → bold @unknown (<id>), no crash", () => {
+    const output = makeOutput();
+    output.sessions[0].timeline[0].text = "<@1> hi";
+    const resolved = resolveNames(output.sessions[0], output.users, output.channels);
+    const sections = buildSections([resolved], makeOptions()); // no 4th arg
+    assert.deepEqual(messageBodyRuns(sections), [
+      { text: "@unknown (1)", bold: true, size: 21 },
+      { text: " hi", bold: false, size: 21 },
+    ]);
+  });
+
+  it("role <@&123> and channel <#456> stay raw as single plain run", () => {
+    const sections = mentionSections("hey <@&123> see <#456>");
+    assert.deepEqual(messageBodyRuns(sections), [
+      { text: "hey <@&123> see <#456>", bold: false, size: 21 },
+    ]);
+  });
+
+  it("backward compat: buildSections without users on mention-free text → single plain run", () => {
+    const sections = mentionSections("hello world");
+    assert.deepEqual(messageBodyRuns(sections), [
+      { text: "hello world", bold: false, size: 21 },
+    ]);
+  });
+
+  it("main threads ExportOutput.users → docx contains resolved mention, no raw id", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "docx-mention-main-"));
+    try {
+      const output = makeOutput();
+      output.users["292426742264627200"] = { username: "pete", displayName: "Pete", globalName: "Pete G" };
+      output.sessions[0].timeline[0].text = "Hi <@292426742264627200>!";
+      const inputPath = path.join(tmp, "messages.json");
+      fs.writeFileSync(inputPath, JSON.stringify(output));
+      const written: Buffer[] = [];
+      const io: ReportIO = {
+        readFileSync: (p: string, _e: string) => fs.readFileSync(p, "utf-8"),
+        writeFileSync: (_p: string, data: Buffer) => { written.push(data); },
+        mkdirSync: (_p: string, _o: any) => {},
+        exit: (code: number) => { if (code !== 0) throw new Error(`exit ${code}`); },
+      };
+      await main(["--input", inputPath, "--output", path.join(tmp, "out.docx")], io);
+      assert.equal(written.length, 1, "must write one docx");
+      const JSZip = (await import("jszip")).default;
+      const zip = await JSZip.loadAsync(written[0]);
+      const xml = await zip.file("word/document.xml")!.async("string");
+      assert.ok(xml.includes("@Pete"), "docx must contain resolved display name");
+      assert.ok(!xml.includes("292426742264627200"), "raw mention id must not leak into docx");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
 });
